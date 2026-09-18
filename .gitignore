@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+# AI Agents
+.code-review-graph/
+specs/
+CLAUDE.md
+
