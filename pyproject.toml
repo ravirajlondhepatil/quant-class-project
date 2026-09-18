@@ -1,0 +1,55 @@
+[project]
+name = "quant-class-project"
+version = "0.1.0"
+description = "Statistical arbitrage research in cryptocurrencies (momentum & reversal) — WSQ course project"
+authors = [
+    { name = "Ravi Londhe", email = "raviraj.londhe.patil@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "pandas>=2.2",
+    "ccxt>=4.3",
+    "pyarrow>=16.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.6",
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.1,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "quant_project"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+    "RUF", # ruff-specific
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=quant_project --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["src/quant_project"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true
