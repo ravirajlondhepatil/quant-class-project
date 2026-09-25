@@ -9,9 +9,11 @@ strategies) — Wall Street Quants course project.
 
 ## Status
 
-Phase 1 (Data Infrastructure) — not started. See
-[`specs/implementation-spec.md`](specs/implementation-spec.md) for the
-checklist; boxes are ticked there as each item is finished.
+Phase 1 (Data Infrastructure) — not started.
+Phase 2 (Signal Research) — momentum signals done (`src/quant_project/signals/momentum.py`,
+tested in `tests/test_momentum.py`); reversal signals not started.
+See [`specs/implementation-spec.md`](specs/implementation-spec.md) for the
+full checklist; boxes are ticked there as each item is finished.
 
 Project tooling is set up: `uv` for dependency/environment management,
 `ruff` for linting, `pytest` + `pytest-cov` for testing and coverage.
