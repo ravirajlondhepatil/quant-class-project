@@ -18,6 +18,10 @@ and execution cost model (`src/quant_project/backtest.py`,
 `src/quant_project/costs.py`) and strategy weighting/combination
 (`src/quant_project/combination.py` — equal-weight, inverse-volatility,
 and IC-weighted combination of multiple strategy signals).
+Phase 4 (Performance Reporting) — performance metrics and historical view
+done (`src/quant_project/performance.py` — cumulative gross/net returns,
+annualized return/volatility, Sharpe ratio, drawdown, and alpha/beta vs. a
+benchmark); no dashboard/notebook yet.
 All of the above are tested in `tests/test_quant_project.py`.
 See [`specs/implementation-spec.md`](specs/implementation-spec.md) for the
 full checklist; boxes are ticked there as each item is finished.

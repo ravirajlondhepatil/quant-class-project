@@ -15,6 +15,7 @@ import pandas as pd
 
 from quant_project.backtest import run_multi_strategy_backtest
 from quant_project.combination import combine_signals
+from quant_project.performance import build_performance_report
 from quant_project.signals.momentum import ema_crossover_momentum, time_horizon_momentum
 from quant_project.signals.reversal import time_horizon_reversal
 
@@ -32,9 +33,22 @@ def _synthetic_prices() -> pd.DataFrame:
     return pd.DataFrame(prices, index=index, columns=ASSETS)
 
 
+def _print_report(name: str, report) -> None:
+    print(
+        f"{name:15s}  cum net: {report.cumulative_net.iloc[-1]:+7.2%}"
+        f"  ann.ret: {report.annualized_return:+7.2%}"
+        f"  ann.vol: {report.annualized_volatility:6.2%}"
+        f"  sharpe: {report.sharpe_ratio:+5.2f}"
+        f"  max dd: {report.max_drawdown:7.2%}"
+        f"  alpha: {report.alpha:+7.2%}"
+        f"  beta: {report.beta:+5.2f}"
+    )
+
+
 def main() -> None:
     prices = _synthetic_prices()
     returns = prices.pct_change()
+    benchmark_returns = returns["BTC"]  # per specs/requirement-spec.md: "e.g. BTC"
 
     signals = {
         "momentum_7d": time_horizon_momentum(prices, lookback=7),
@@ -42,17 +56,13 @@ def main() -> None:
         "reversal_1d": time_horizon_reversal(prices, lookback=1),
     }
 
-    print("=== Individual strategies (Feature 4) ===")
+    print("=== Individual strategies (Feature 4) — performance report (Feature 6) ===")
     results = run_multi_strategy_backtest(signals, returns)
     for name, result in results.items():
-        cumulative_net = (1 + result.net_returns.fillna(0)).prod() - 1
-        avg_turnover = result.turnover.mean()
-        print(
-            f"{name:15s}  cumulative net return: {cumulative_net:+.2%}"
-            f"   avg turnover: {avg_turnover:.2f}"
-        )
+        report = build_performance_report(result, benchmark_returns=benchmark_returns)
+        _print_report(name, report)
 
-    print("\n=== Combined strategy (Feature 5) ===")
+    print("\n=== Combined strategy (Feature 5) — performance report (Feature 6) ===")
     for method, kwargs in [
         ("equal", {}),
         ("inverse_vol", {"strategy_returns": {n: r.net_returns for n, r in results.items()}}),
@@ -60,8 +70,8 @@ def main() -> None:
     ]:
         combined_signal = combine_signals(signals, method=method, **kwargs)
         combined_result = run_multi_strategy_backtest({method: combined_signal}, returns)[method]
-        cumulative_net = (1 + combined_result.net_returns.fillna(0)).prod() - 1
-        print(f"{method:15s}  cumulative net return: {cumulative_net:+.2%}")
+        report = build_performance_report(combined_result, benchmark_returns=benchmark_returns)
+        _print_report(method, report)
 
 
 if __name__ == "__main__":

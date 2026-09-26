@@ -13,6 +13,7 @@ import pandas as pd
 import pytest
 
 from quant_project.backtest import (
+    BacktestResult,
     UnconstrainedBacktester,
     build_dollar_neutral_weights,
     run_multi_strategy_backtest,
@@ -30,6 +31,16 @@ from quant_project.costs import (
     apply_transaction_costs,
     cost_bps_for,
     net_of_costs,
+)
+from quant_project.performance import (
+    alpha_beta,
+    annualized_return,
+    annualized_volatility,
+    build_performance_report,
+    cumulative_returns,
+    drawdown_series,
+    max_drawdown,
+    sharpe_ratio,
 )
 from quant_project.signals.momentum import (
     activity_weighted_momentum,
@@ -755,3 +766,153 @@ def test_combine_signals_rejects_unknown_method():
 def test_combine_signals_rejects_empty():
     with pytest.raises(ValueError):
         combine_signals({}, method="equal")
+
+
+# =============================================================================
+# performance.py — Feature 6
+# =============================================================================
+
+
+# ---------------------------------------------------------------------------
+# 6.1 cumulative_returns
+# ---------------------------------------------------------------------------
+def test_cumulative_returns_compounds():
+    returns = pd.Series([0.1, -0.1, 0.1], index=_idx(3))
+    # step1: 1.1 - 1 = 0.1
+    # step2: 1.1*0.9 = 0.99 -> -0.01
+    # step3: 0.99*1.1 = 1.089 -> 0.089
+    expected = pd.Series([0.1, -0.01, 0.089], index=_idx(3))
+    pd.testing.assert_series_equal(cumulative_returns(returns), expected, atol=1e-9)
+
+
+def test_cumulative_returns_treats_nan_as_zero():
+    returns = pd.Series([0.1, np.nan, 0.1], index=_idx(3))
+    # step2 is a no-op (treated as 0 return): stays at 0.1
+    # step3: 1.1*1.1 = 1.21 -> 0.21
+    expected = pd.Series([0.1, 0.1, 0.21], index=_idx(3))
+    pd.testing.assert_series_equal(cumulative_returns(returns), expected, atol=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# 6.2 annualized_return / annualized_volatility
+# ---------------------------------------------------------------------------
+def test_annualized_return_compounds_and_scales_by_periods_ratio():
+    returns = pd.Series([0.1, 0.1], index=_idx(2))
+    # total_growth = 1.1*1.1 = 1.21 ; periods_per_year/n_periods = 4/2 = 2
+    # annualized = 1.21^2 - 1 = 1.4641 - 1 = 0.4641
+    result = annualized_return(returns, periods_per_year=4)
+    assert result == pytest.approx(0.4641)
+
+
+def test_annualized_return_empty_series_is_nan():
+    assert np.isnan(annualized_return(pd.Series([], dtype=float)))
+
+
+def test_annualized_volatility_scales_std_by_sqrt_periods():
+    returns = pd.Series([0.01, -0.01, 0.02, -0.02], index=_idx(4))
+    # var (ddof=1) = (0.0001+0.0001+0.0004+0.0004)/3 = 0.001/3
+    expected = (0.001 / 3) ** 0.5 * 2  # sqrt(periods_per_year=4) = 2
+    result = annualized_volatility(returns, periods_per_year=4)
+    assert result == pytest.approx(expected)
+
+
+# ---------------------------------------------------------------------------
+# 6.3 sharpe_ratio
+# ---------------------------------------------------------------------------
+def test_sharpe_ratio_combines_annualized_return_and_vol():
+    returns = pd.Series([0.05, -0.05], index=_idx(2))
+    # total_growth = 1.05*0.95 = 0.9975 -> annualized_return (n=2, ppy=2) = -0.0025
+    # var (ddof=1) = (0.05^2+0.05^2)/1 = 0.005 -> annualized_vol = sqrt(0.005*2) = sqrt(0.01) = 0.1
+    # sharpe = -0.0025 / 0.1 = -0.025
+    result = sharpe_ratio(returns, periods_per_year=2)
+    assert result == pytest.approx(-0.025)
+
+
+def test_sharpe_ratio_nan_when_vol_is_zero():
+    returns = pd.Series([0.02, 0.02], index=_idx(2))
+    assert np.isnan(sharpe_ratio(returns))
+
+
+# ---------------------------------------------------------------------------
+# 6.4 / 6.6 drawdown_series / max_drawdown
+# ---------------------------------------------------------------------------
+def test_drawdown_series_tracks_peak_to_trough():
+    returns = pd.Series([0.1, -0.2, 0.05], index=_idx(3))
+    # wealth = [1.1, 0.88, 0.924] ; running max = [1.1, 1.1, 1.1]
+    # drawdown = [0, 0.88/1.1 - 1, 0.924/1.1 - 1] = [0, -0.2, -0.16]
+    expected = pd.Series([0.0, -0.2, -0.16], index=_idx(3))
+    pd.testing.assert_series_equal(drawdown_series(returns), expected, atol=1e-9)
+
+
+def test_max_drawdown_is_series_minimum():
+    returns = pd.Series([0.1, -0.2, 0.05], index=_idx(3))
+    assert max_drawdown(returns) == pytest.approx(-0.2)
+
+
+# ---------------------------------------------------------------------------
+# 6.5 alpha_beta
+# ---------------------------------------------------------------------------
+def test_alpha_beta_recovers_exact_linear_relationship():
+    # strategy = 1.5 * benchmark + 0.002 exactly (no noise), so OLS should
+    # recover beta=1.5 and a per-period alpha of 0.002 exactly.
+    benchmark = pd.Series([0.01, 0.02, -0.01, 0.03], index=_idx(4))
+    strategy = 1.5 * benchmark + 0.002
+
+    alpha, beta = alpha_beta(strategy, benchmark, periods_per_year=1)
+    assert beta == pytest.approx(1.5)
+    assert alpha == pytest.approx(0.002)  # periods_per_year=1 -> no compounding effect
+
+
+def test_alpha_beta_rejects_zero_variance_benchmark():
+    benchmark = pd.Series([0.01, 0.01, 0.01], index=_idx(3))
+    strategy = pd.Series([0.02, -0.01, 0.03], index=_idx(3))
+    with pytest.raises(ValueError):
+        alpha_beta(strategy, benchmark)
+
+
+def test_alpha_beta_rejects_insufficient_overlap():
+    benchmark = pd.Series([0.01], index=_idx(1))
+    strategy = pd.Series([0.02], index=_idx(1))
+    with pytest.raises(ValueError):
+        alpha_beta(strategy, benchmark)
+
+
+# ---------------------------------------------------------------------------
+# 6.6 / 6.7 build_performance_report
+# ---------------------------------------------------------------------------
+def test_build_performance_report_assembles_all_metrics():
+    net_returns = pd.Series([0.05, -0.05], index=_idx(2))
+    gross_returns = pd.Series([0.06, -0.04], index=_idx(2))
+    result = BacktestResult(
+        weights=pd.DataFrame({"A": [1.0, 1.0]}, index=_idx(2)),
+        turnover=pd.Series([1.0, 0.0], index=_idx(2)),
+        gross_returns=gross_returns,
+        net_returns=net_returns,
+    )
+    # Benchmark identical to net_returns -> beta=1.0, alpha=0.0 exactly.
+    benchmark = net_returns.copy()
+
+    report = build_performance_report(result, periods_per_year=2, benchmark_returns=benchmark)
+
+    pd.testing.assert_series_equal(report.cumulative_gross, cumulative_returns(gross_returns))
+    pd.testing.assert_series_equal(report.cumulative_net, cumulative_returns(net_returns))
+    pd.testing.assert_series_equal(report.drawdown, drawdown_series(net_returns))
+    assert report.annualized_return == pytest.approx(annualized_return(net_returns, 2))
+    assert report.annualized_volatility == pytest.approx(annualized_volatility(net_returns, 2))
+    assert report.sharpe_ratio == pytest.approx(sharpe_ratio(net_returns, 2))
+    assert report.max_drawdown == pytest.approx(max_drawdown(net_returns))
+    assert report.alpha == pytest.approx(0.0)
+    assert report.beta == pytest.approx(1.0)
+
+
+def test_build_performance_report_without_benchmark_leaves_alpha_beta_none():
+    net_returns = pd.Series([0.01, 0.02], index=_idx(2))
+    result = BacktestResult(
+        weights=pd.DataFrame({"A": [1.0, 1.0]}, index=_idx(2)),
+        turnover=pd.Series([0.0, 0.0], index=_idx(2)),
+        gross_returns=net_returns,
+        net_returns=net_returns,
+    )
+    report = build_performance_report(result)
+    assert report.alpha is None
+    assert report.beta is None
