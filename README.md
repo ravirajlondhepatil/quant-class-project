@@ -11,13 +11,14 @@ strategies) — Wall Street Quants course project.
 
 Phase 1 (Data Infrastructure) — not started.
 Phase 2 (Signal Research) — done: momentum signals
-(`src/quant_project/signals/momentum.py`, tested in `tests/test_momentum.py`)
-and reversal signals (`src/quant_project/signals/reversal.py`, tested in
-`tests/test_reversal.py`).
-Phase 3 (Backtesting & Cost Modeling) — unconstrained backtest engine and
-execution cost model done (`src/quant_project/backtest.py`,
-`src/quant_project/costs.py`, tested in `tests/test_backtest.py` and
-`tests/test_costs.py`); strategy weighting/combination not started.
+(`src/quant_project/signals/momentum.py`) and reversal signals
+(`src/quant_project/signals/reversal.py`).
+Phase 3 (Backtesting & Cost Modeling) — done: unconstrained backtest engine
+and execution cost model (`src/quant_project/backtest.py`,
+`src/quant_project/costs.py`) and strategy weighting/combination
+(`src/quant_project/combination.py` — equal-weight, inverse-volatility,
+and IC-weighted combination of multiple strategy signals).
+All of the above are tested in `tests/test_quant_project.py`.
 See [`specs/implementation-spec.md`](specs/implementation-spec.md) for the
 full checklist; boxes are ticked there as each item is finished.
 
@@ -35,6 +36,7 @@ uv sync            # creates .venv/ and installs dependencies
 ```bash
 uv run pytest      # run tests with coverage
 uv run ruff check . # lint
+uv run python main.py  # manual smoke-run: synthetic prices -> signals -> backtest -> combination
 ```
 
 ## Project layout

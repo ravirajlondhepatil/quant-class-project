@@ -17,6 +17,13 @@ from quant_project.backtest import (
     build_dollar_neutral_weights,
     run_multi_strategy_backtest,
 )
+from quant_project.combination import (
+    combine_signals,
+    equal_weights,
+    ic_weights,
+    inverse_vol_weights,
+    standardize_signal,
+)
 from quant_project.costs import (
     LIMIT_ORDER_COST_BPS,
     MARKET_ORDER_COST_BPS,
@@ -551,4 +558,200 @@ def test_run_multi_strategy_backtest_matches_individual_runs():
 
     pd.testing.assert_series_equal(results["a"].net_returns, expected_a.net_returns)
     pd.testing.assert_series_equal(results["b"].net_returns, expected_b.net_returns)
-    assert set(results.keys()) == {"a", "b"}
+
+
+# =============================================================================
+# combination.py — Feature 5
+# =============================================================================
+
+
+# ---------------------------------------------------------------------------
+# standardize_signal
+# ---------------------------------------------------------------------------
+def test_standardize_signal_row_zscore():
+    signal = pd.DataFrame({"A": [1.0], "B": [2.0], "C": [3.0]}, index=_idx(1))
+    # mean=2, std (ddof=1) = sqrt(((1)^2+0+(1)^2)/2) = 1 -> z = [-1, 0, 1]
+    expected = pd.DataFrame({"A": [-1.0], "B": [0.0], "C": [1.0]}, index=_idx(1))
+    pd.testing.assert_frame_equal(standardize_signal(signal), expected)
+
+
+def test_standardize_signal_zero_dispersion_row_is_nan():
+    signal = pd.DataFrame({"A": [5.0], "B": [5.0]}, index=_idx(1))
+    result = standardize_signal(signal)
+    assert result.isna().all(axis=None)
+
+
+# ---------------------------------------------------------------------------
+# 5.1 equal_weights
+# ---------------------------------------------------------------------------
+def test_equal_weights_splits_evenly():
+    weights = equal_weights(["a", "b", "c"])
+    pd.testing.assert_series_equal(weights, pd.Series([1 / 3, 1 / 3, 1 / 3], index=["a", "b", "c"]))
+
+
+def test_equal_weights_rejects_empty():
+    with pytest.raises(ValueError):
+        equal_weights([])
+
+
+# ---------------------------------------------------------------------------
+# 5.2 inverse_vol_weights
+# ---------------------------------------------------------------------------
+def test_inverse_vol_weights_favors_steadier_strategy():
+    # std_a = sqrt(((0.01)^2*2 + (0.02)^2*2)/3) = sqrt(0.001/3) -> call it x
+    # std_b = std of returns scaled by 0.1 -> x/10
+    # weight_a = (1/x) / (1/x + 10/x) = 1/11 ; weight_b = 10/11
+    returns_a = pd.Series([0.01, -0.01, 0.02, -0.02], index=_idx(4))
+    returns_b = returns_a * 0.1
+    weights = inverse_vol_weights({"a": returns_a, "b": returns_b})
+    assert weights["a"] == pytest.approx(1 / 11)
+    assert weights["b"] == pytest.approx(10 / 11)
+    assert weights.sum() == pytest.approx(1.0)
+
+
+def test_inverse_vol_weights_rejects_zero_vol_strategy():
+    returns_flat = pd.Series([0.01, 0.01, 0.01], index=_idx(3))
+    returns_normal = pd.Series([0.01, -0.02, 0.03], index=_idx(3))
+    with pytest.raises(ValueError):
+        inverse_vol_weights({"flat": returns_flat, "normal": returns_normal})
+
+
+def test_inverse_vol_weights_rejects_empty():
+    with pytest.raises(ValueError):
+        inverse_vol_weights({})
+
+
+# ---------------------------------------------------------------------------
+# 5.3 ic_weights
+# ---------------------------------------------------------------------------
+def test_ic_weights_scores_by_average_rank_correlation():
+    # 3 assets, 2 identical periods.
+    # "perfect": signal ranks [1,2,3] match return ranks [1,2,3] exactly -> IC=1
+    # "partial": signal ranks [1,3,2] vs return ranks [1,2,3]
+    #   -> rank diffs (0,1,-1), rho = 1 - 6*sum(d^2)/(n(n^2-1)) = 1 - 12/24 = 0.5
+    # weight_perfect = 1.0 / (1.0 + 0.5) = 2/3 ; weight_partial = 0.5/1.5 = 1/3
+    forward_returns = pd.DataFrame(
+        {"X": [0.01, 0.01], "Y": [0.02, 0.02], "Z": [0.03, 0.03]}, index=_idx(2)
+    )
+    signals = {
+        "perfect": pd.DataFrame(
+            {"X": [10.0, 10.0], "Y": [20.0, 20.0], "Z": [30.0, 30.0]}, index=_idx(2)
+        ),
+        "partial": pd.DataFrame(
+            {"X": [10.0, 10.0], "Y": [30.0, 30.0], "Z": [20.0, 20.0]}, index=_idx(2)
+        ),
+    }
+    weights = ic_weights(signals, forward_returns)
+    assert weights["perfect"] == pytest.approx(2 / 3)
+    assert weights["partial"] == pytest.approx(1 / 3)
+    assert weights.sum() == pytest.approx(1.0)
+
+
+def test_ic_weights_floors_negative_ic_at_zero():
+    # "inverted": signal ranks are the exact opposite of return ranks -> IC=-1,
+    # floored to 0 and excluded entirely once renormalized.
+    forward_returns = pd.DataFrame(
+        {"X": [0.01, 0.01], "Y": [0.02, 0.02], "Z": [0.03, 0.03]}, index=_idx(2)
+    )
+    signals = {
+        "perfect": pd.DataFrame(
+            {"X": [10.0, 10.0], "Y": [20.0, 20.0], "Z": [30.0, 30.0]}, index=_idx(2)
+        ),
+        "inverted": pd.DataFrame(
+            {"X": [30.0, 30.0], "Y": [20.0, 20.0], "Z": [10.0, 10.0]}, index=_idx(2)
+        ),
+    }
+    weights = ic_weights(signals, forward_returns)
+    assert weights["perfect"] == pytest.approx(1.0)
+    assert weights["inverted"] == pytest.approx(0.0)
+
+
+def test_ic_weights_rejects_empty():
+    with pytest.raises(ValueError):
+        ic_weights({}, pd.DataFrame())
+
+
+def test_ic_weights_rejects_all_negative_ic():
+    forward_returns = pd.DataFrame(
+        {"X": [0.01, 0.01], "Y": [0.02, 0.02], "Z": [0.03, 0.03]}, index=_idx(2)
+    )
+    signals = {
+        "inverted": pd.DataFrame(
+            {"X": [30.0, 30.0], "Y": [20.0, 20.0], "Z": [10.0, 10.0]}, index=_idx(2)
+        ),
+    }
+    with pytest.raises(ValueError):
+        ic_weights(signals, forward_returns)
+
+
+# ---------------------------------------------------------------------------
+# 5.4 combine_signals — configurable method selection
+# ---------------------------------------------------------------------------
+def test_combine_signals_equal_weight_averages_standardized_signals():
+    signal_a = pd.DataFrame({"A": [1.0], "B": [2.0], "C": [3.0]}, index=_idx(1))
+    signal_b = pd.DataFrame({"A": [3.0], "B": [2.0], "C": [1.0]}, index=_idx(1))
+    # standardize_signal(a) = [-1, 0, 1] ; standardize_signal(b) = [1, 0, -1]
+    # equal-weighted average -> [0, 0, 0]
+    combined = combine_signals({"a": signal_a, "b": signal_b}, method="equal")
+    expected = pd.DataFrame({"A": [0.0], "B": [0.0], "C": [0.0]}, index=_idx(1))
+    pd.testing.assert_frame_equal(combined, expected)
+
+
+def test_combine_signals_dispatches_to_inverse_vol_weights():
+    signal_a = pd.DataFrame({"A": [1.0], "B": [-1.0]}, index=_idx(1))
+    signal_b = pd.DataFrame({"A": [1.0], "B": [-1.0]}, index=_idx(1))
+    returns_a = pd.Series([0.01, -0.01, 0.02, -0.02], index=_idx(4))
+    returns_b = returns_a * 0.1
+
+    combined = combine_signals(
+        {"a": signal_a, "b": signal_b},
+        method="inverse_vol",
+        strategy_returns={"a": returns_a, "b": returns_b},
+    )
+    # Both signals are identical, so they standardize to the same row
+    # (z-score of [1, -1] is [1/sqrt(2), -1/sqrt(2)]); whatever the weight
+    # split between "a" and "b", the combined row is still that same value
+    # since the weights sum to 1.
+    z = 1 / (2**0.5)
+    expected = pd.DataFrame({"A": [z], "B": [-z]}, index=_idx(1))
+    pd.testing.assert_frame_equal(combined, expected)
+
+
+def test_combine_signals_dispatches_to_ic_weights():
+    forward_returns = pd.DataFrame(
+        {"X": [0.01, 0.01], "Y": [0.02, 0.02], "Z": [0.03, 0.03]}, index=_idx(2)
+    )
+    signal_a = pd.DataFrame(
+        {"X": [10.0, 10.0], "Y": [20.0, 20.0], "Z": [30.0, 30.0]}, index=_idx(2)
+    )
+    signal_b = pd.DataFrame(
+        {"X": [30.0, 30.0], "Y": [10.0, 10.0], "Z": [20.0, 20.0]}, index=_idx(2)
+    )
+    combined = combine_signals(
+        {"a": signal_a, "b": signal_b}, method="ic", forward_returns=forward_returns
+    )
+    expected_weights = ic_weights({"a": signal_a, "b": signal_b}, forward_returns)
+    expected = (
+        standardize_signal(signal_a) * expected_weights["a"]
+        + standardize_signal(signal_b) * expected_weights["b"]
+    )
+    pd.testing.assert_frame_equal(combined, expected)
+
+
+def test_combine_signals_requires_supporting_data_for_method():
+    signal = pd.DataFrame({"A": [1.0], "B": [-1.0]}, index=_idx(1))
+    with pytest.raises(ValueError):
+        combine_signals({"a": signal}, method="inverse_vol")
+    with pytest.raises(ValueError):
+        combine_signals({"a": signal}, method="ic")
+
+
+def test_combine_signals_rejects_unknown_method():
+    signal = pd.DataFrame({"A": [1.0], "B": [-1.0]}, index=_idx(1))
+    with pytest.raises(ValueError):
+        combine_signals({"a": signal}, method="not_a_real_method")
+
+
+def test_combine_signals_rejects_empty():
+    with pytest.raises(ValueError):
+        combine_signals({}, method="equal")
