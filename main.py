@@ -1,11 +1,16 @@
 """Manual smoke-run of the pipeline built so far: signals -> backtest ->
-strategy combination (Features 2-5 in specs/feature-list.md).
+strategy combination -> performance report (Features 2-6 in
+specs/feature-list.md), with every backtest run audit-logged (Feature 7.4).
 
-Phase 1 (real exchange data ingestion, specs/feature-list.md 1.1-1.5) isn't
-built yet, so there's no live OHLCV to run this against. This script
-generates a small synthetic multi-asset price panel instead, purely so the
-functions that *do* exist can be exercised end to end and inspected by eye.
-Swap ``_synthetic_prices()`` out for a real loader once Phase 1 lands.
+Phase 1's real exchange data ingestion (specs/feature-list.md 1.1-1.5,
+src/quant_project/data.py) needs network access this script deliberately
+doesn't require, so it isn't wired in here — see
+tests/test_quant_project.py for that module's (network-free) tests against
+a fake exchange client. This script generates a small synthetic
+multi-asset price panel instead, purely so the functions that *do* run
+without a network call can be exercised end to end and inspected by eye.
+Swap ``_synthetic_prices()`` out for ``quant_project.data.load_universe_ohlcv``
+once you're ready to point this at a real exchange.
 """
 
 from __future__ import annotations
@@ -13,6 +18,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from quant_project.audit import log_run
 from quant_project.backtest import run_multi_strategy_backtest
 from quant_project.combination import combine_signals
 from quant_project.performance import build_performance_report
@@ -61,6 +67,15 @@ def main() -> None:
     for name, result in results.items():
         report = build_performance_report(result, benchmark_returns=benchmark_returns)
         _print_report(name, report)
+        log_run(
+            "backtest",
+            parameters={"strategy": name, "assets": ASSETS, "n_periods": N_PERIODS},
+            result_summary={
+                "cumulative_net": report.cumulative_net.iloc[-1],
+                "sharpe_ratio": report.sharpe_ratio,
+                "max_drawdown": report.max_drawdown,
+            },
+        )
 
     print("\n=== Combined strategy (Feature 5) — performance report (Feature 6) ===")
     for method, kwargs in [
@@ -72,6 +87,21 @@ def main() -> None:
         combined_result = run_multi_strategy_backtest({method: combined_signal}, returns)[method]
         report = build_performance_report(combined_result, benchmark_returns=benchmark_returns)
         _print_report(method, report)
+        log_run(
+            "backtest",
+            parameters={
+                "strategy": f"combined_{method}",
+                "combination_method": method,
+                "component_strategies": list(signals.keys()),
+            },
+            result_summary={
+                "cumulative_net": report.cumulative_net.iloc[-1],
+                "sharpe_ratio": report.sharpe_ratio,
+                "max_drawdown": report.max_drawdown,
+            },
+        )
+
+    print("\n(audit trail for this run: data/audit_log.jsonl)")
 
 
 if __name__ == "__main__":

@@ -225,3 +225,9 @@ CLAUDE.md
 
 # Documents
 ref/
+
+# Local data cache & audit log (specs/feature-list.md 1.3, 7.4) — generated,
+# not source; the directory structure itself (data/raw/) is kept via .gitkeep
+data/raw/*
+!data/raw/.gitkeep
+data/audit_log.jsonl

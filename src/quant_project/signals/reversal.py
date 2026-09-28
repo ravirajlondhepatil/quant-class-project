@@ -119,7 +119,11 @@ def macro_conditioned_reversal(
     ``dislocation_indicator`` is a single time series aligned to
     ``prices.index`` (e.g. realized volatility, implied volatility, return
     dispersion, or average pairwise correlation — the indicators
-    ref/ClassProject.docx names). The base reversal signal is multiplied by
+    ref/ClassProject.docx names). See ``signals/indicators.py`` for
+    ready-made ``realized_volatility_indicator`` /
+    ``return_dispersion_indicator`` / ``average_pairwise_correlation_indicator``
+    implementations of three of these (implied volatility needs options
+    data this project doesn't ingest). The base reversal signal is multiplied by
     the indicator's rolling-rank (0-1) so reversal is stronger when the
     indicator is elevated relative to its own history, and floored to zero
     below ``dislocation_threshold_quantile`` so the signal is only active in

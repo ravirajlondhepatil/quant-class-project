@@ -1,17 +1,22 @@
 """Tests for the quant_project package — combined into one file.
 
-Covers: signals/momentum.py (Feature 2), signals/reversal.py (Feature 3),
-costs.py (Feature 4.5), and backtest.py (Feature 4). Expected values are
-hand-computed in comments, not derived by calling the function under test
-differently — the point is to catch wrong numbers, not just confirm it runs.
+Covers: data.py and audit.py (Phase 1 / Feature 7), signals/momentum.py
+(Feature 2), signals/reversal.py (Feature 3), costs.py (Feature 4.5),
+backtest.py (Feature 4), combination.py (Feature 5), and performance.py
+(Feature 6). Expected values are hand-computed in comments, not derived by
+calling the function under test differently — the point is to catch wrong
+numbers, not just confirm it runs.
 """
 
 from __future__ import annotations
+
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 
+from quant_project.audit import log_run, read_audit_log
 from quant_project.backtest import (
     BacktestResult,
     UnconstrainedBacktester,
@@ -32,6 +37,20 @@ from quant_project.costs import (
     cost_bps_for,
     net_of_costs,
 )
+from quant_project.data import (
+    OHLCV_COLUMNS,
+    DataRequest,
+    build_exchange_client,
+    cache_path,
+    fetch_ohlcv_from_exchange,
+    is_cache_fresh,
+    load_multi_exchange_universe,
+    load_symbol_ohlcv,
+    load_universe_ohlcv,
+    read_cache,
+    validate_ohlcv,
+    write_cache,
+)
 from quant_project.performance import (
     alpha_beta,
     annualized_return,
@@ -41,6 +60,11 @@ from quant_project.performance import (
     drawdown_series,
     max_drawdown,
     sharpe_ratio,
+)
+from quant_project.signals.indicators import (
+    average_pairwise_correlation_indicator,
+    realized_volatility_indicator,
+    return_dispersion_indicator,
 )
 from quant_project.signals.momentum import (
     activity_weighted_momentum,
@@ -63,6 +87,371 @@ from quant_project.signals.reversal import (
 
 def _idx(n: int) -> pd.DatetimeIndex:
     return pd.date_range("2024-01-01", periods=n, freq="D")
+
+
+class _FakeExchange:
+    """Test double for a ccxt exchange client. Returns one fixed page of
+    OHLCV rows per call (in the order given), regardless of the `since` it's
+    called with — pagination progress in fetch_ohlcv_from_exchange is driven
+    purely by the timestamps in what's returned, exactly like a real
+    exchange, so this is enough to exercise that logic without a network
+    call. Tracks `calls` so a test can assert pagination stopped when it
+    should have.
+    """
+
+    def __init__(self, pages: list[list[list]]):
+        self._pages = list(pages)
+        self.calls = 0
+
+    def fetch_ohlcv(self, symbol, timeframe, since, limit):
+        self.calls += 1
+        if not self._pages:
+            return []
+        return self._pages.pop(0)
+
+
+# =============================================================================
+# audit.py — Feature 7.4
+# =============================================================================
+def test_log_run_appends_record_with_timestamp(tmp_path):
+    log_path = tmp_path / "audit.jsonl"
+    record = log_run("data_load", {"symbol": "BTC/USDT"}, {"rows": 10}, log_path=log_path)
+    assert record["event_type"] == "data_load"
+    assert record["parameters"] == {"symbol": "BTC/USDT"}
+    assert record["result_summary"] == {"rows": 10}
+    assert "timestamp" in record
+    assert read_audit_log(log_path) == [record]
+
+
+def test_log_run_appends_multiple_records_in_order(tmp_path):
+    log_path = tmp_path / "audit.jsonl"
+    log_run("a", {}, log_path=log_path)
+    log_run("b", {}, log_path=log_path)
+    assert [r["event_type"] for r in read_audit_log(log_path)] == ["a", "b"]
+
+
+def test_log_run_defaults_result_summary_to_empty_dict(tmp_path):
+    log_path = tmp_path / "audit.jsonl"
+    log_run("data_load", {"symbol": "BTC/USDT"}, log_path=log_path)
+    assert read_audit_log(log_path)[0]["result_summary"] == {}
+
+
+def test_log_run_stringifies_non_json_native_values(tmp_path):
+    log_path = tmp_path / "audit.jsonl"
+    log_run("data_load", {"start": pd.Timestamp("2024-01-01")}, log_path=log_path)
+    assert read_audit_log(log_path)[0]["parameters"]["start"] == str(pd.Timestamp("2024-01-01"))
+
+
+def test_read_audit_log_missing_file_returns_empty(tmp_path):
+    assert read_audit_log(tmp_path / "nope.jsonl") == []
+
+
+# =============================================================================
+# data.py — Phase 1 & Feature 7 (data layer)
+# =============================================================================
+
+
+# ---------------------------------------------------------------------------
+# 1.2 / 7.1 DataRequest validation
+# ---------------------------------------------------------------------------
+def test_data_request_normalizes_start_end_to_timestamps():
+    request = DataRequest("binance", ["BTC/USDT"], "1d", "2024-01-01", "2024-02-01")
+    assert request.start == pd.Timestamp("2024-01-01")
+    assert request.end == pd.Timestamp("2024-02-01")
+
+
+def test_data_request_rejects_empty_symbols():
+    with pytest.raises(ValueError):
+        DataRequest("binance", [], "1d", "2024-01-01", "2024-02-01")
+
+
+def test_data_request_rejects_blank_symbol():
+    with pytest.raises(ValueError):
+        DataRequest("binance", ["BTC/USDT", "  "], "1d", "2024-01-01", "2024-02-01")
+
+
+def test_data_request_rejects_unsupported_timeframe():
+    with pytest.raises(ValueError):
+        DataRequest("binance", ["BTC/USDT"], "7m", "2024-01-01", "2024-02-01")
+
+
+def test_data_request_rejects_inverted_date_range():
+    with pytest.raises(ValueError):
+        DataRequest("binance", ["BTC/USDT"], "1d", "2024-02-01", "2024-01-01")
+
+
+def test_data_request_rejects_blank_exchange_id():
+    with pytest.raises(ValueError):
+        DataRequest("  ", ["BTC/USDT"], "1d", "2024-01-01", "2024-02-01")
+
+
+# ---------------------------------------------------------------------------
+# 1.1 / 7.2 Exchange client & OHLCV retrieval
+# ---------------------------------------------------------------------------
+def test_build_exchange_client_enables_rate_limiting():
+    exchange = build_exchange_client("binance")
+    assert exchange.enableRateLimit is True
+
+
+def test_build_exchange_client_rejects_unknown_exchange():
+    with pytest.raises(ValueError):
+        build_exchange_client("not_a_real_exchange")
+
+
+def test_fetch_ohlcv_from_exchange_paginates_until_short_page():
+    # page1 is full-length (== limit) so pagination continues; page2 is
+    # shorter than limit, which is the "no more data" signal to stop.
+    page1 = [[0, 1, 1, 1, 1, 1], [60_000, 1, 1, 1, 1, 1]]
+    page2 = [[120_000, 1, 1, 1, 1, 1]]
+    exchange = _FakeExchange([page1, page2])
+
+    result = fetch_ohlcv_from_exchange(
+        exchange,
+        "BTC/USDT",
+        "1m",
+        start=pd.Timestamp(0, unit="ms"),
+        end=pd.Timestamp(200_000, unit="ms"),
+        limit=2,
+    )
+
+    assert exchange.calls == 2
+    assert len(result) == 3
+    assert list(result.columns) == OHLCV_COLUMNS
+    assert result.index[0] == pd.Timestamp(0, unit="ms")
+
+
+def test_fetch_ohlcv_from_exchange_stops_on_stalled_cursor():
+    # Full-length page (== limit) so the "short page" stop wouldn't fire on
+    # its own, but its last timestamp doesn't advance past the cursor that
+    # produced it -- the stalled-cursor guard must stop pagination after one
+    # call instead of re-requesting the same window forever.
+    stale_page = [[100, 1, 1, 1, 1, 1], [300, 1, 1, 1, 1, 1], [500, 1, 1, 1, 1, 1]]
+    exchange = _FakeExchange([stale_page, stale_page, stale_page])
+
+    fetch_ohlcv_from_exchange(
+        exchange,
+        "BTC/USDT",
+        "1m",
+        start=pd.Timestamp(1000, unit="ms"),
+        end=pd.Timestamp(999_999, unit="ms"),
+        limit=3,
+    )
+
+    assert exchange.calls == 1
+
+
+def test_fetch_ohlcv_from_exchange_empty_result_has_expected_columns():
+    exchange = _FakeExchange([])
+    result = fetch_ohlcv_from_exchange(
+        exchange,
+        "BTC/USDT",
+        "1m",
+        start=pd.Timestamp("2024-01-01"),
+        end=pd.Timestamp("2024-01-02"),
+    )
+    assert list(result.columns) == OHLCV_COLUMNS
+    assert result.empty
+
+
+# ---------------------------------------------------------------------------
+# 1.3 / 1.4 / 7.3 Parquet cache
+# ---------------------------------------------------------------------------
+def test_cache_path_is_deterministic_and_sanitizes_symbol():
+    cache_dir = Path("/tmp/quant-project-cache-test")
+    path = cache_path("binance", "BTC/USDT", "1d", cache_dir=cache_dir)
+    assert path == cache_dir / "binance" / "1d" / "BTC-USDT.parquet"
+    assert cache_path("binance", "BTC/USDT", "1d", cache_dir=cache_dir) == path
+
+
+def test_read_cache_missing_file_returns_none(tmp_path):
+    assert read_cache(tmp_path / "nope.parquet") is None
+
+
+def test_write_then_read_cache_roundtrips(tmp_path):
+    df = pd.DataFrame({"open": [1.0, 2.0]}, index=_idx(2))
+    path = tmp_path / "sub" / "BTC-USDT.parquet"
+    write_cache(df, path)
+    pd.testing.assert_frame_equal(read_cache(path), df, check_freq=False)
+
+
+def test_is_cache_fresh_true_when_range_covered():
+    idx = pd.date_range("2024-01-01", "2024-01-31", freq="D")
+    cached = pd.DataFrame({"close": range(len(idx))}, index=idx)
+    assert is_cache_fresh(cached, pd.Timestamp("2024-01-05"), pd.Timestamp("2024-01-20")) is True
+
+
+def test_is_cache_fresh_false_when_range_not_covered():
+    idx = pd.date_range("2024-01-01", "2024-01-10", freq="D")
+    cached = pd.DataFrame({"close": range(len(idx))}, index=idx)
+    assert is_cache_fresh(cached, pd.Timestamp("2024-01-01"), pd.Timestamp("2024-01-20")) is False
+
+
+def test_is_cache_fresh_false_when_none_or_empty():
+    assert is_cache_fresh(None, pd.Timestamp("2024-01-01"), pd.Timestamp("2024-01-02")) is False
+    assert (
+        is_cache_fresh(pd.DataFrame(), pd.Timestamp("2024-01-01"), pd.Timestamp("2024-01-02"))
+        is False
+    )
+
+
+# ---------------------------------------------------------------------------
+# 1.5 validate_ohlcv
+# ---------------------------------------------------------------------------
+def test_validate_ohlcv_removes_duplicate_timestamps():
+    idx = pd.DatetimeIndex(["2024-01-01", "2024-01-01", "2024-01-02"])
+    df = pd.DataFrame({"close": [1.0, 1.5, 2.0]}, index=idx)
+    report = validate_ohlcv(df, "1d")
+    assert report.duplicates_removed == 1
+    assert list(report.cleaned["close"]) == [1.0, 2.0]  # keeps first occurrence
+
+
+def test_validate_ohlcv_detects_gaps():
+    idx = pd.date_range("2024-01-01", "2024-01-05", freq="D").delete(2)  # drop 01-03
+    df = pd.DataFrame({"close": range(len(idx))}, index=idx)
+    report = validate_ohlcv(df, "1d")
+    assert list(report.gap_timestamps) == [pd.Timestamp("2024-01-03")]
+
+
+def test_validate_ohlcv_flags_insufficient_history():
+    df = pd.DataFrame({"close": range(5)}, index=pd.date_range("2024-01-01", periods=5, freq="D"))
+    report = validate_ohlcv(df, "1d", min_periods=30)
+    assert report.has_sufficient_history is False
+
+
+def test_validate_ohlcv_sufficient_history_when_enough_bars():
+    df = pd.DataFrame({"close": range(30)}, index=pd.date_range("2024-01-01", periods=30, freq="D"))
+    report = validate_ohlcv(df, "1d", min_periods=30)
+    assert report.has_sufficient_history is True
+
+
+def test_validate_ohlcv_no_gaps_reported_for_short_series():
+    df = pd.DataFrame({"close": [1.0]}, index=pd.DatetimeIndex(["2024-01-01"]))
+    report = validate_ohlcv(df, "1d")
+    assert len(report.gap_timestamps) == 0
+
+
+# ---------------------------------------------------------------------------
+# load_symbol_ohlcv / load_universe_ohlcv — orchestration
+# ---------------------------------------------------------------------------
+def test_load_symbol_ohlcv_fetches_then_reuses_cache(tmp_path):
+    cache_dir = tmp_path / "cache"
+    audit_log_path = tmp_path / "audit.jsonl"
+    request = DataRequest(
+        "binance", ["BTC/USDT"], "1m", pd.Timestamp(0, unit="ms"), pd.Timestamp(120_000, unit="ms")
+    )
+    page = [[0, 1, 1, 1, 1, 1], [60_000, 1, 1, 1, 1, 1], [120_000, 1, 1, 1, 1, 1]]
+    exchange = _FakeExchange([page])
+
+    df1, report1 = load_symbol_ohlcv(
+        request, "BTC/USDT", cache_dir=cache_dir, exchange=exchange, audit_log_path=audit_log_path
+    )
+    assert len(df1) == 3
+    assert exchange.calls == 1
+    assert report1.duplicates_removed == 0
+
+    # Cache now fully covers the requested range -> second call must not
+    # trigger another exchange fetch.
+    df2, _ = load_symbol_ohlcv(
+        request, "BTC/USDT", cache_dir=cache_dir, exchange=exchange, audit_log_path=audit_log_path
+    )
+    pd.testing.assert_frame_equal(df2, df1)
+    assert exchange.calls == 1
+
+    records = read_audit_log(audit_log_path)
+    assert [r["result_summary"]["source"] for r in records] == ["fetched", "cache"]
+
+
+def test_load_symbol_ohlcv_force_refresh_bypasses_cache(tmp_path):
+    cache_dir = tmp_path / "cache"
+    request = DataRequest(
+        "binance", ["BTC/USDT"], "1m", pd.Timestamp(0, unit="ms"), pd.Timestamp(120_000, unit="ms")
+    )
+    page = [[0, 1, 1, 1, 1, 1], [60_000, 1, 1, 1, 1, 1], [120_000, 1, 1, 1, 1, 1]]
+    exchange = _FakeExchange([page, page])
+
+    load_symbol_ohlcv(
+        request, "BTC/USDT", cache_dir=cache_dir, exchange=exchange, audit_log_path=None
+    )
+    assert exchange.calls == 1
+
+    load_symbol_ohlcv(
+        request,
+        "BTC/USDT",
+        cache_dir=cache_dir,
+        exchange=exchange,
+        force_refresh=True,
+        audit_log_path=None,
+    )
+    assert exchange.calls == 2
+
+
+def test_load_universe_ohlcv_loads_every_symbol(tmp_path):
+    cache_dir = tmp_path / "cache"
+    request = DataRequest(
+        "binance",
+        ["BTC/USDT", "ETH/USDT"],
+        "1m",
+        pd.Timestamp(0, unit="ms"),
+        pd.Timestamp(60_000, unit="ms"),
+    )
+    page = [[0, 1, 1, 1, 1, 1], [60_000, 1, 1, 1, 1, 1]]
+    exchange = _FakeExchange([list(page), list(page)])
+
+    results = load_universe_ohlcv(
+        request, cache_dir=cache_dir, exchange=exchange, audit_log_path=None
+    )
+
+    assert set(results.keys()) == {"BTC/USDT", "ETH/USDT"}
+    for df, _report in results.values():
+        assert len(df) == 2
+    assert exchange.calls == 2
+
+
+# ---------------------------------------------------------------------------
+# 1.1 load_multi_exchange_universe — literal "multi-exchange" ingestion
+# ---------------------------------------------------------------------------
+def test_load_multi_exchange_universe_merges_across_exchanges(tmp_path):
+    cache_dir = tmp_path / "cache"
+    request_binance = DataRequest(
+        "binance", ["BTC/USDT"], "1m", pd.Timestamp(0, unit="ms"), pd.Timestamp(60_000, unit="ms")
+    )
+    request_kraken = DataRequest(
+        "kraken", ["ETH/USD"], "1m", pd.Timestamp(0, unit="ms"), pd.Timestamp(60_000, unit="ms")
+    )
+    page = [[0, 1, 1, 1, 1, 1], [60_000, 1, 1, 1, 1, 1]]
+    exchange_binance = _FakeExchange([list(page)])
+    exchange_kraken = _FakeExchange([list(page)])
+
+    results = load_multi_exchange_universe(
+        [request_binance, request_kraken],
+        cache_dir=cache_dir,
+        exchanges={"binance": exchange_binance, "kraken": exchange_kraken},
+        audit_log_path=None,
+    )
+
+    assert set(results.keys()) == {"BTC/USDT", "ETH/USD"}
+    assert exchange_binance.calls == 1
+    assert exchange_kraken.calls == 1
+
+
+def test_load_multi_exchange_universe_rejects_duplicate_symbol_across_exchanges(tmp_path):
+    cache_dir = tmp_path / "cache"
+    request_a = DataRequest(
+        "binance", ["BTC/USDT"], "1m", pd.Timestamp(0, unit="ms"), pd.Timestamp(60_000, unit="ms")
+    )
+    request_b = DataRequest(
+        "kraken", ["BTC/USDT"], "1m", pd.Timestamp(0, unit="ms"), pd.Timestamp(60_000, unit="ms")
+    )
+    page = [[0, 1, 1, 1, 1, 1], [60_000, 1, 1, 1, 1, 1]]
+    exchange = _FakeExchange([list(page), list(page)])
+
+    with pytest.raises(ValueError):
+        load_multi_exchange_universe(
+            [request_a, request_b],
+            cache_dir=cache_dir,
+            exchanges={"binance": exchange, "kraken": exchange},
+            audit_log_path=None,
+        )
 
 
 # =============================================================================
@@ -346,6 +735,66 @@ def test_macro_conditioned_reversal_scales_by_dislocation_percentile():
     # result = reversal * scale
     expected = pd.DataFrame({"A": [np.nan, -0.0, -0.075, -0.10]}, index=_idx(4))
     pd.testing.assert_frame_equal(result, expected, check_exact=False, atol=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# signals/indicators.py — macro dislocation indicators for 3.4
+# ---------------------------------------------------------------------------
+def test_realized_volatility_indicator_averages_rolling_asset_vol():
+    # A: 100 -> 110 -> 99 (+10%, -10% exactly); B: 100 -> 90 -> 99 (-10%, +10%)
+    prices = pd.DataFrame({"A": [100.0, 110.0, 99.0], "B": [100.0, 90.0, 99.0]}, index=_idx(3))
+
+    result = realized_volatility_indicator(prices, lookback=2)
+
+    # returns: A=[nan,.10,-.10], B=[nan,-.10,.10]
+    # rolling(2).std() needs 2 non-NaN in the window:
+    #   t0: NaN (only the NaN return so far) ; t1: window has 1 valid value -> NaN
+    #   t2: window=[.10,-.10] (or [-.10,.10]) -> std (ddof=1) = sqrt(0.02) for both assets
+    # mean across assets at t2 = sqrt(0.02)
+    expected = pd.Series([np.nan, np.nan, 0.02**0.5], index=_idx(3))
+    pd.testing.assert_series_equal(result, expected, atol=1e-9)
+
+
+def test_return_dispersion_indicator_instantaneous_cross_sectional_std():
+    prices = pd.DataFrame({"A": [100.0, 110.0, 99.0], "B": [100.0, 90.0, 99.0]}, index=_idx(3))
+
+    result = return_dispersion_indicator(prices)
+
+    # t0: both returns NaN -> NaN
+    # t1: [.10, -.10] -> std (ddof=1) = sqrt(0.02) ; t2: [-.10, .10] -> same
+    expected = pd.Series([np.nan, 0.02**0.5, 0.02**0.5], index=_idx(3))
+    pd.testing.assert_series_equal(result, expected, atol=1e-9)
+
+
+def test_return_dispersion_indicator_lookback_smooths_with_rolling_mean():
+    prices = pd.DataFrame({"A": [100.0, 110.0, 99.0], "B": [100.0, 90.0, 99.0]}, index=_idx(3))
+
+    result = return_dispersion_indicator(prices, lookback=2)
+
+    # instantaneous dispersion = [nan, sqrt(0.02), sqrt(0.02)]
+    # rolling(2).mean(): t1's window [nan, sqrt(0.02)] has only 1 valid -> NaN
+    #                    t2's window [sqrt(0.02), sqrt(0.02)] -> sqrt(0.02)
+    expected = pd.Series([np.nan, np.nan, 0.02**0.5], index=_idx(3))
+    pd.testing.assert_series_equal(result, expected, atol=1e-9)
+
+
+def test_average_pairwise_correlation_indicator_perfectly_anticorrelated():
+    # A and B move exactly opposite each other every period -> corr = -1.0
+    prices = pd.DataFrame({"A": [100.0, 110.0, 99.0], "B": [100.0, 90.0, 99.0]}, index=_idx(3))
+
+    result = average_pairwise_correlation_indicator(prices, lookback=2)
+
+    # t0: before lookback window is available -> NaN
+    # t1: window=[t0(nan,nan), t1(.10,-.10)] -> only 1 valid row -> corr undefined -> NaN
+    # t2: window=[t1(.10,-.10), t2(-.10,.10)] -> exactly anti-correlated -> -1.0
+    expected = pd.Series([np.nan, np.nan, -1.0], index=_idx(3))
+    pd.testing.assert_series_equal(result, expected, atol=1e-9)
+
+
+def test_average_pairwise_correlation_indicator_rejects_single_asset():
+    prices = pd.DataFrame({"A": [100.0, 110.0, 99.0]}, index=_idx(3))
+    with pytest.raises(ValueError):
+        average_pairwise_correlation_indicator(prices, lookback=2)
 
 
 # ---------------------------------------------------------------------------
