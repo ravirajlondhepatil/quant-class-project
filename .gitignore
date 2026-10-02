@@ -231,3 +231,9 @@ ref/
 data/raw/*
 !data/raw/.gitkeep
 data/audit_log.jsonl
+
+# Defensive: a notebook kernel's cwd is its own directory (notebooks/), not
+# the repo root, so an un-pathed run could duplicate the cache/audit-log
+# here. notebooks/performance_summary.ipynb explicitly resolves to the
+# repo-root data/ dir to avoid this; this entry is just a safety net.
+notebooks/data/
