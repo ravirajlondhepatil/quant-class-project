@@ -1,13 +1,18 @@
 """Train/test split and candidate selection — C3/C4 in
-specs/methodology-fixes-scope.md.
+specs/methodology-fixes-scope.md, plus walk-forward folds for
+``optimize.py``'s parameter search.
 
-Three small, independent primitives:
+Four small, independent primitives:
 
 - ``split_prices`` (C3): a strictly chronological, non-overlapping
   train/test split of a price panel — never shuffled, since shuffling a
   time series for a train/test split would itself be a look-ahead bug (a
   "training" bar could land after a "test" bar it's supposed to be
   evaluated against).
+- ``generate_walk_forward_folds``: the same idea repeated across several
+  sequential, expanding-window folds, for searching a wider parameter
+  space without the overfitting risk of judging it on a single split —
+  see its own docstring.
 - ``select_best`` (C3): picks whichever named candidate has the highest
   score. It doesn't know or care what a "candidate" or a "score" is —
   callers compute each candidate's selection metric (e.g.
@@ -80,6 +85,63 @@ def split_prices(prices: pd.DataFrame, train_fraction: float = 0.7) -> TrainTest
         test_prices=prices.iloc[split_idx:],
         split_date=split_date,
     )
+
+
+def generate_walk_forward_folds(
+    prices: pd.DataFrame,
+    n_folds: int = 5,
+    initial_train_fraction: float = 0.5,
+) -> list[TrainTestSplit]:
+    """Sequential, expanding-window walk-forward folds.
+
+    Fold 0's train window is the first ``initial_train_fraction`` of bars;
+    the remaining bars are divided into ``n_folds`` equal-sized test
+    blocks. Each later fold's train window *expands* to also include every
+    earlier fold's test block — an anchored walk-forward, not a
+    fixed-size rolling one, so a parameter choice for fold i uses all
+    history available by that point, exactly as a live, periodically
+    re-optimizing strategy would.
+
+    Each fold is returned as an ordinary ``TrainTestSplit``, so the same
+    ``select_best``/``slice_backtest_result`` machinery already used for a
+    single train/test split works unchanged per fold. Concatenating every
+    fold's out-of-sample (test) return series end to end gives one
+    continuous, honestly-out-of-sample walk-forward return series — the
+    right number to report when the question is "would periodically
+    re-optimizing have actually worked over time," not just "did one
+    split happen to work."
+    """
+    if not 0.0 < initial_train_fraction < 1.0:
+        raise ValueError("initial_train_fraction must be between 0 and 1")
+    if n_folds < 1:
+        raise ValueError("n_folds must be >= 1")
+
+    n = len(prices)
+    initial_train_end = round(n * initial_train_fraction)
+    initial_train_end = min(max(initial_train_end, 1), n - 1)
+
+    remaining = n - initial_train_end
+    if remaining < n_folds:
+        raise ValueError(
+            f"not enough bars ({remaining}) after the initial training window "
+            f"to form {n_folds} walk-forward test fold(s)"
+        )
+
+    boundaries = [initial_train_end + round(remaining * (i + 1) / n_folds) for i in range(n_folds)]
+    boundaries[-1] = n  # rounding must never drop the last few bars
+
+    folds = []
+    start = initial_train_end
+    for boundary in boundaries:
+        folds.append(
+            TrainTestSplit(
+                train_prices=prices.iloc[:start],
+                test_prices=prices.iloc[start:boundary],
+                split_date=prices.index[start],
+            )
+        )
+        start = boundary
+    return folds
 
 
 def select_best(candidate_scores: dict[str, float]) -> str:

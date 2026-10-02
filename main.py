@@ -14,10 +14,13 @@ out-of-sample (test) — never a single blended number — so a parameter
 choice that only worked by coincidence on the training window shows up as
 a gap between the two, not as one deceptively good headline figure.
 
-Known remaining issue (out of scope for C, tracked as D in that same scope
-doc): this script still just dumps numbers: no stated hypothesis, no
-economic rationale, no "here's the conclusion" framing. That's D1's job,
-deliberately sequenced after C.
+This script's own console output is still the raw numbers, by design —
+the hypothesis-by-hypothesis research narrative behind them (D1 in
+specs/methodology-fixes-scope.md: what each strategy was testing, why its
+train-vs-test result came out the way it did, and the overall conclusion)
+lives in ``notebooks/performance_summary.ipynb``, where prose and live
+numbers can sit side by side. The one-line finding printed at the end of
+this run is a pointer there, not a substitute for it.
 """
 
 from __future__ import annotations
@@ -213,7 +216,14 @@ def main() -> None:
         f"combined_{best_method}", combined_result, split, benchmark_returns
     )
 
-    print("\n(audit trail for this run: data/audit_log.jsonl)")
+    print(
+        "\nFinding: none of the three signals (or their combination) shows a real, "
+        "cost-surviving out-of-sample edge in this universe/period. 1-day reversal is "
+        "reliably *negative* in both train and test — real short-term momentum, not "
+        "reversal, likely because the sample is dominated by a broad bull trend. "
+        "Full reasoning per strategy: notebooks/performance_summary.ipynb."
+    )
+    print("(audit trail for this run: data/audit_log.jsonl)")
 
 
 if __name__ == "__main__":

@@ -53,7 +53,12 @@ from quant_project.data import (
     validate_ohlcv,
     write_cache,
 )
-from quant_project.model_selection import select_best, slice_backtest_result, split_prices
+from quant_project.model_selection import (
+    generate_walk_forward_folds,
+    select_best,
+    slice_backtest_result,
+    split_prices,
+)
 from quant_project.performance import (
     alpha_beta,
     annualized_return,
@@ -1645,6 +1650,54 @@ def test_split_prices_rejects_too_few_bars():
     prices = pd.DataFrame({"A": [1.0]}, index=_idx(1))
     with pytest.raises(ValueError):
         split_prices(prices, train_fraction=0.5)
+
+
+# ---------------------------------------------------------------------------
+# generate_walk_forward_folds
+# ---------------------------------------------------------------------------
+def test_generate_walk_forward_folds_expanding_window_and_full_coverage():
+    # n=20, initial_train_fraction=0.5 -> initial_train_end=10, remaining=10,
+    # split into 4 folds -> boundaries [12, 15, 18, 20] (hand-verified via
+    # Python's round(), which is round-half-to-even).
+    idx = _idx(20)
+    prices = pd.DataFrame({"A": range(20)}, index=idx)
+
+    folds = generate_walk_forward_folds(prices, n_folds=4, initial_train_fraction=0.5)
+
+    assert len(folds) == 4
+    expected_train_len = [10, 12, 15, 18]
+    expected_test_len = [2, 3, 3, 2]
+    for i, fold in enumerate(folds):
+        assert len(fold.train_prices) == expected_train_len[i]
+        assert len(fold.test_prices) == expected_test_len[i]
+        # Expanding: each fold's train window is exactly the previous
+        # fold's train window plus its test window (anchored, not rolling).
+        if i > 0:
+            assert list(fold.train_prices.index) == list(folds[i - 1].train_prices.index) + list(
+                folds[i - 1].test_prices.index
+            )
+
+    # No bar dropped or duplicated: every fold's test block end to end
+    # reconstructs exactly the remaining (post-initial-train) history.
+    reconstructed = pd.concat([fold.test_prices for fold in folds])
+    pd.testing.assert_index_equal(reconstructed.index, idx[10:])
+
+
+def test_generate_walk_forward_folds_rejects_invalid_inputs():
+    prices = pd.DataFrame({"A": range(20)}, index=_idx(20))
+    with pytest.raises(ValueError):
+        generate_walk_forward_folds(prices, initial_train_fraction=0.0)
+    with pytest.raises(ValueError):
+        generate_walk_forward_folds(prices, initial_train_fraction=1.0)
+    with pytest.raises(ValueError):
+        generate_walk_forward_folds(prices, n_folds=0)
+
+
+def test_generate_walk_forward_folds_rejects_too_many_folds_for_remaining_bars():
+    prices = pd.DataFrame({"A": range(10)}, index=_idx(10))
+    # initial_train_fraction=0.9 -> only 1 bar remains, can't make 5 folds from it.
+    with pytest.raises(ValueError):
+        generate_walk_forward_folds(prices, n_folds=5, initial_train_fraction=0.9)
 
 
 # ---------------------------------------------------------------------------

@@ -39,7 +39,12 @@ Train/test split and parameter selection (`src/quant_project/model_selection.py`
 — C3/C4): momentum lookback, EMA fast/slow pair, and combination method
 are each chosen by training-period Sharpe only, then every strategy is
 reported separately in-sample and out-of-sample, both in `main.py` and
-the notebook.
+the notebook. The notebook (D1) leads with a stated hypothesis and
+economic rationale per strategy and an overall research conclusion —
+none of the three signals shows a real, cost-surviving out-of-sample
+edge in this universe/period — pushing the metrics table/charts to an
+appendix; see `specs/methodology-fixes-scope.md` section D for the full
+writeup.
 
 Phase 5 (Data Integrity & Reproducibility, cross-cutting) — done: input
 validation on run configuration (`DataRequest` in `data.py`, and now
@@ -71,7 +76,20 @@ uv sync --group notebooks   # also installs jupyter/matplotlib for notebooks/
 uv run pytest      # run tests with coverage
 uv run ruff check . # lint
 uv run python main.py  # real data -> train/test split + param selection -> backtest -> combination -> report
+uv run python optimize.py  # wider walk-forward parameter search (5 folds) -- see its own docstring
 ```
+
+`optimize.py` is a separate, exploratory follow-up to `main.py`: it widens
+the lookback/EMA/combination-method search and re-selects across 5
+sequential walk-forward folds instead of one static split, reporting the
+concatenated out-of-sample result as the honest number. As of the last
+run, the answer is still "no cost-surviving edge" — if anything, the
+walk-forward view makes the finding *stronger*: 1-day-ish reversal is
+significantly negative in every single fold, not just one split, while
+momentum/EMA crossover flip sign fold to fold (unstable, consistent with
+chasing noise rather than a real effect). Widening the search further
+doesn't bypass that; see the script's own docstring for the
+multiple-comparisons caveat.
 
 ## Notebooks
 
