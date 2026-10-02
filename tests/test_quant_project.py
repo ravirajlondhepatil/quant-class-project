@@ -40,6 +40,8 @@ from quant_project.costs import (
 from quant_project.data import (
     OHLCV_COLUMNS,
     DataRequest,
+    ValidationReport,
+    build_close_price_panel,
     build_exchange_client,
     cache_path,
     fetch_ohlcv_from_exchange,
@@ -50,6 +52,12 @@ from quant_project.data import (
     read_cache,
     validate_ohlcv,
     write_cache,
+)
+from quant_project.model_selection import (
+    generate_walk_forward_folds,
+    select_best,
+    slice_backtest_result,
+    split_prices,
 )
 from quant_project.performance import (
     alpha_beta,
@@ -454,6 +462,56 @@ def test_load_multi_exchange_universe_rejects_duplicate_symbol_across_exchanges(
         )
 
 
+# ---------------------------------------------------------------------------
+# build_close_price_panel
+# ---------------------------------------------------------------------------
+def _universe_entry(closes: list[float], sufficient: bool = True) -> tuple:
+    df = pd.DataFrame({"close": closes}, index=_idx(len(closes)))
+    report = ValidationReport(
+        cleaned=df,
+        duplicates_removed=0,
+        gap_timestamps=pd.DatetimeIndex([]),
+        has_sufficient_history=sufficient,
+    )
+    return df, report
+
+
+def test_build_close_price_panel_combines_symbols_into_wide_frame():
+    universe = {
+        "BTC/USDT": _universe_entry([100.0, 101.0]),
+        "ETH/USDT": _universe_entry([10.0, 10.5]),
+    }
+    panel = build_close_price_panel(universe)
+    expected = pd.DataFrame(
+        {"BTC/USDT": [100.0, 101.0], "ETH/USDT": [10.0, 10.5]}, index=_idx(2)
+    )
+    pd.testing.assert_frame_equal(panel.sort_index(axis=1), expected.sort_index(axis=1))
+
+
+def test_build_close_price_panel_drops_insufficient_history_by_default():
+    universe = {
+        "BTC/USDT": _universe_entry([100.0, 101.0], sufficient=True),
+        "NEW/USDT": _universe_entry([1.0, 1.1], sufficient=False),
+    }
+    panel = build_close_price_panel(universe)
+    assert list(panel.columns) == ["BTC/USDT"]
+
+
+def test_build_close_price_panel_can_keep_insufficient_history():
+    universe = {
+        "BTC/USDT": _universe_entry([100.0, 101.0], sufficient=True),
+        "NEW/USDT": _universe_entry([1.0, 1.1], sufficient=False),
+    }
+    panel = build_close_price_panel(universe, require_sufficient_history=False)
+    assert set(panel.columns) == {"BTC/USDT", "NEW/USDT"}
+
+
+def test_build_close_price_panel_rejects_all_insufficient():
+    universe = {"NEW/USDT": _universe_entry([1.0, 1.1], sufficient=False)}
+    with pytest.raises(ValueError):
+        build_close_price_panel(universe)
+
+
 # =============================================================================
 # signals/momentum.py (Feature 2)
 # =============================================================================
@@ -721,19 +779,47 @@ def test_correlation_reversal_scores_opposite_signs_for_a_pair():
 # ---------------------------------------------------------------------------
 # 3.4 macro_conditioned_reversal
 # ---------------------------------------------------------------------------
-def test_macro_conditioned_reversal_scales_by_dislocation_percentile():
+def test_macro_conditioned_reversal_scales_by_expanding_dislocation_percentile():
     prices = pd.DataFrame({"A": [100.0, 110.0, 121.0, 133.1]}, index=_idx(4))
-    dislocation = pd.Series([1.0, 2.0, 3.0, 4.0], index=_idx(4))  # monotonic -> clean percentiles
+    # Not monotonic, specifically so an *expanding* percentile differs from
+    # ranking against the whole series (the B3 bug this replaces): at t=1,
+    # 1.0 is the lowest value seen *so far* (50th percentile of {3.0, 1.0}),
+    # but it's also the lowest of the *whole* series -- under the old bug
+    # it would have ranked 0.25 there instead of 0.5.
+    dislocation = pd.Series([3.0, 1.0, 4.0, 2.0], index=_idx(4))
 
     result = macro_conditioned_reversal(
         prices, lookback=1, dislocation_indicator=dislocation, dislocation_threshold_quantile=0.7
     )
 
     # reversal = -pct_change(1) = [nan, -.10, -.10, -.10]
-    # percentile_rank (pct=True, 4 ascending values) = [.25, .50, .75, 1.0]
-    # active (>=0.7): [F, F, T, T] -> scale = [0, 0, .75, 1.0]
-    # result = reversal * scale
-    expected = pd.DataFrame({"A": [np.nan, -0.0, -0.075, -0.10]}, index=_idx(4))
+    # expanding percentile at t = (count of values seen through t that are
+    # <= value[t]) / (count of values seen through t):
+    #   t0: {3.0} -> 1/1 = 1.0
+    #   t1: {3.0, 1.0}, value=1.0 -> 1/2 = 0.5
+    #   t2: {3.0, 1.0, 4.0}, value=4.0 -> 3/3 = 1.0
+    #   t3: {3.0, 1.0, 4.0, 2.0}, value=2.0 -> 2/4 = 0.5
+    # active (>=0.7): [T, F, T, F] -> scale = [1.0, 0, 1.0, 0]
+    expected = pd.DataFrame({"A": [np.nan, -0.0, -0.10, -0.0]}, index=_idx(4))
+    pd.testing.assert_frame_equal(result, expected, check_exact=False, atol=1e-9)
+
+
+def test_macro_conditioned_reversal_handles_nan_indicator_values():
+    # A leading NaN in the indicator (e.g. a rolling-computed indicator's
+    # own warm-up, exactly what signals/indicators.py's functions produce)
+    # must be skipped, not propagate into every later percentile.
+    prices = pd.DataFrame({"A": [100.0, 110.0, 121.0]}, index=_idx(3))
+    dislocation = pd.Series([np.nan, 1.0, 2.0], index=_idx(3))
+
+    result = macro_conditioned_reversal(
+        prices, lookback=1, dislocation_indicator=dislocation, dislocation_threshold_quantile=0.7
+    )
+
+    # reversal = -pct_change(1) = [nan, -.10, -.10]
+    # percentile_rank: t0 undefined (NaN input) -> NaN;
+    #   t1: valid={1.0} -> 1/1 = 1.0 ; t2: valid={1.0, 2.0} -> 2/2 = 1.0
+    # active (>=0.7): NaN>=0.7 is False -> [F, T, T] -> scale = [0.0, 1.0, 1.0]
+    expected = pd.DataFrame({"A": [np.nan, -0.10, -0.10]}, index=_idx(3))
     pd.testing.assert_frame_equal(result, expected, check_exact=False, atol=1e-9)
 
 
@@ -1055,25 +1141,59 @@ def test_equal_weights_rejects_empty():
 
 
 # ---------------------------------------------------------------------------
-# 5.2 inverse_vol_weights
+# 5.2 inverse_vol_weights (time-varying per specs/methodology-fixes-scope.md B1)
 # ---------------------------------------------------------------------------
-def test_inverse_vol_weights_favors_steadier_strategy():
-    # std_a = sqrt(((0.01)^2*2 + (0.02)^2*2)/3) = sqrt(0.001/3) -> call it x
-    # std_b = std of returns scaled by 0.1 -> x/10
-    # weight_a = (1/x) / (1/x + 10/x) = 1/11 ; weight_b = 10/11
-    returns_a = pd.Series([0.01, -0.01, 0.02, -0.02], index=_idx(4))
+def test_inverse_vol_weights_is_time_varying_and_favors_steadier_strategy():
+    # returns_b is always exactly 1/10th the magnitude of returns_a, so
+    # whatever expanding window is used, b's trailing std is always 1/10th
+    # of a's -- the same 1/11 : 10/11 split should hold at every row once
+    # there's enough strictly-past history, not just once over the full
+    # sample.
+    idx = _idx(5)
+    returns_a = pd.Series([0.01, -0.01, 0.02, -0.02, 0.03], index=idx)
     returns_b = returns_a * 0.1
-    weights = inverse_vol_weights({"a": returns_a, "b": returns_b})
-    assert weights["a"] == pytest.approx(1 / 11)
-    assert weights["b"] == pytest.approx(10 / 11)
-    assert weights.sum() == pytest.approx(1.0)
+
+    weights = inverse_vol_weights({"a": returns_a, "b": returns_b}, min_periods=2)
+
+    # Rows 0-1: fewer than 2 strictly-past (shift(1)'d) observations exist
+    # yet -- undefined.
+    assert weights.iloc[0].isna().all()
+    assert weights.iloc[1].isna().all()
+    for t in range(2, 5):
+        assert weights["a"].iloc[t] == pytest.approx(1 / 11)
+        assert weights["b"].iloc[t] == pytest.approx(10 / 11)
+        assert weights.iloc[t].sum() == pytest.approx(1.0)
 
 
-def test_inverse_vol_weights_rejects_zero_vol_strategy():
-    returns_flat = pd.Series([0.01, 0.01, 0.01], index=_idx(3))
-    returns_normal = pd.Series([0.01, -0.02, 0.03], index=_idx(3))
-    with pytest.raises(ValueError):
-        inverse_vol_weights({"flat": returns_flat, "normal": returns_normal})
+def test_inverse_vol_weights_excludes_bar_ts_own_return():
+    # B1: a weight set for bar t must only reflect returns known *before*
+    # t. Changing bar 4's own return must not change bar 4's weight (nor
+    # any earlier bar's).
+    idx = _idx(5)
+    returns_a = pd.Series([0.01, -0.01, 0.02, -0.02, 0.03], index=idx)
+    returns_b = returns_a * 0.1
+    weights_1 = inverse_vol_weights({"a": returns_a, "b": returns_b}, min_periods=2)
+
+    returns_a_alt = returns_a.copy()
+    returns_a_alt.iloc[4] = 999.0
+    weights_2 = inverse_vol_weights({"a": returns_a_alt, "b": returns_b}, min_periods=2)
+
+    pd.testing.assert_frame_equal(weights_1, weights_2)
+
+
+def test_inverse_vol_weights_treats_zero_trailing_vol_as_undefined_not_an_error():
+    # A strategy whose trailing return history has zero variance would
+    # divide by zero if taken at face value; it should drop out as
+    # undefined for that bar (letting the other strategy take 100% of the
+    # weight) rather than raising and aborting the whole run.
+    idx = _idx(4)
+    flat = pd.Series([0.01, 0.01, 0.01, 0.01], index=idx)
+    normal = pd.Series([0.01, -0.02, 0.03, -0.01], index=idx)
+
+    weights = inverse_vol_weights({"flat": flat, "normal": normal}, min_periods=2)
+
+    assert weights["flat"].iloc[2:].isna().all()
+    assert (weights["normal"].iloc[2:] == 1.0).all()
 
 
 def test_inverse_vol_weights_rejects_empty():
@@ -1082,48 +1202,81 @@ def test_inverse_vol_weights_rejects_empty():
 
 
 # ---------------------------------------------------------------------------
-# 5.3 ic_weights
+# 5.3 ic_weights (time-varying + genuinely-forward return, B1 + B2)
 # ---------------------------------------------------------------------------
-def test_ic_weights_scores_by_average_rank_correlation():
-    # 3 assets, 2 identical periods.
-    # "perfect": signal ranks [1,2,3] match return ranks [1,2,3] exactly -> IC=1
+def test_ic_weights_is_time_varying_and_uses_genuinely_forward_returns():
+    # 3 assets, 4 identical periods (so the rank-correlation math is the
+    # same every period -- only the expanding/shift machinery varies).
+    # "perfect": signal ranks match return ranks exactly -> per-period IC=1
     # "partial": signal ranks [1,3,2] vs return ranks [1,2,3]
     #   -> rank diffs (0,1,-1), rho = 1 - 6*sum(d^2)/(n(n^2-1)) = 1 - 12/24 = 0.5
-    # weight_perfect = 1.0 / (1.0 + 0.5) = 2/3 ; weight_partial = 0.5/1.5 = 1/3
+    idx = _idx(4)
     forward_returns = pd.DataFrame(
-        {"X": [0.01, 0.01], "Y": [0.02, 0.02], "Z": [0.03, 0.03]}, index=_idx(2)
+        {"X": [0.01] * 4, "Y": [0.02] * 4, "Z": [0.03] * 4}, index=idx
     )
     signals = {
         "perfect": pd.DataFrame(
-            {"X": [10.0, 10.0], "Y": [20.0, 20.0], "Z": [30.0, 30.0]}, index=_idx(2)
+            {"X": [10.0] * 4, "Y": [20.0] * 4, "Z": [30.0] * 4}, index=idx
         ),
         "partial": pd.DataFrame(
-            {"X": [10.0, 10.0], "Y": [30.0, 30.0], "Z": [20.0, 20.0]}, index=_idx(2)
+            {"X": [10.0] * 4, "Y": [30.0] * 4, "Z": [20.0] * 4}, index=idx
         ),
     }
-    weights = ic_weights(signals, forward_returns)
-    assert weights["perfect"] == pytest.approx(2 / 3)
-    assert weights["partial"] == pytest.approx(1 / 3)
-    assert weights.sum() == pytest.approx(1.0)
+
+    weights = ic_weights(signals, forward_returns, min_periods=1)
+
+    # Row 0: no strictly-past, fully-realized IC exists yet (the IC
+    # attributed to row 0 itself needs row 1's forward return, so it isn't
+    # knowable until row 1) -- undefined.
+    assert weights.iloc[0].isna().all()
+    # Rows 1-3: weight_perfect = 1.0/(1.0+0.5) = 2/3 ; weight_partial = 1/3,
+    # at every row (the per-period IC is identical every period here).
+    for t in range(1, 4):
+        assert weights["perfect"].iloc[t] == pytest.approx(2 / 3)
+        assert weights["partial"].iloc[t] == pytest.approx(1 / 3)
+
+
+def test_ic_weights_weight_at_t_unaffected_by_returns_strictly_after_t():
+    # B2/B1 together: a weight set for bar t must not depend on returns
+    # realized after t. Scrambling only the *last* period's return must
+    # leave every earlier bar's weight unchanged.
+    idx = _idx(5)
+    forward_returns = pd.DataFrame(
+        {"X": [0.01] * 5, "Y": [0.02] * 5, "Z": [0.03] * 5}, index=idx
+    )
+    signal = pd.DataFrame(
+        {"X": [10.0] * 5, "Y": [20.0] * 5, "Z": [30.0] * 5}, index=idx
+    )
+
+    weights_1 = ic_weights({"s": signal}, forward_returns, min_periods=1)
+
+    forward_returns_alt = forward_returns.copy()
+    forward_returns_alt.iloc[4] = [999.0, -999.0, 0.0]
+    weights_2 = ic_weights({"s": signal}, forward_returns_alt, min_periods=1)
+
+    pd.testing.assert_series_equal(weights_1["s"].iloc[:4], weights_2["s"].iloc[:4])
 
 
 def test_ic_weights_floors_negative_ic_at_zero():
-    # "inverted": signal ranks are the exact opposite of return ranks -> IC=-1,
-    # floored to 0 and excluded entirely once renormalized.
+    # "inverted": signal ranks are the exact opposite of return ranks ->
+    # per-period IC=-1, floored to 0 and excluded entirely once renormalized.
+    idx = _idx(3)
     forward_returns = pd.DataFrame(
-        {"X": [0.01, 0.01], "Y": [0.02, 0.02], "Z": [0.03, 0.03]}, index=_idx(2)
+        {"X": [0.01] * 3, "Y": [0.02] * 3, "Z": [0.03] * 3}, index=idx
     )
     signals = {
         "perfect": pd.DataFrame(
-            {"X": [10.0, 10.0], "Y": [20.0, 20.0], "Z": [30.0, 30.0]}, index=_idx(2)
+            {"X": [10.0] * 3, "Y": [20.0] * 3, "Z": [30.0] * 3}, index=idx
         ),
         "inverted": pd.DataFrame(
-            {"X": [30.0, 30.0], "Y": [20.0, 20.0], "Z": [10.0, 10.0]}, index=_idx(2)
+            {"X": [30.0] * 3, "Y": [20.0] * 3, "Z": [10.0] * 3}, index=idx
         ),
     }
-    weights = ic_weights(signals, forward_returns)
-    assert weights["perfect"] == pytest.approx(1.0)
-    assert weights["inverted"] == pytest.approx(0.0)
+
+    weights = ic_weights(signals, forward_returns, min_periods=1)
+
+    assert weights["perfect"].iloc[1:].eq(1.0).all()
+    assert weights["inverted"].iloc[1:].eq(0.0).all()
 
 
 def test_ic_weights_rejects_empty():
@@ -1131,17 +1284,24 @@ def test_ic_weights_rejects_empty():
         ic_weights({}, pd.DataFrame())
 
 
-def test_ic_weights_rejects_all_negative_ic():
+def test_ic_weights_undefined_when_no_strategy_has_positive_trailing_ic():
+    # Replaces the old "rejects all-negative IC" behavior: with only one
+    # (always-negative-IC) strategy, every row's weight is undefined
+    # (NaN) rather than the call raising -- a multi-year backtest
+    # shouldn't abort over a stretch where nothing currently looks good.
+    idx = _idx(3)
     forward_returns = pd.DataFrame(
-        {"X": [0.01, 0.01], "Y": [0.02, 0.02], "Z": [0.03, 0.03]}, index=_idx(2)
+        {"X": [0.01] * 3, "Y": [0.02] * 3, "Z": [0.03] * 3}, index=idx
     )
     signals = {
         "inverted": pd.DataFrame(
-            {"X": [30.0, 30.0], "Y": [20.0, 20.0], "Z": [10.0, 10.0]}, index=_idx(2)
+            {"X": [30.0] * 3, "Y": [20.0] * 3, "Z": [10.0] * 3}, index=idx
         ),
     }
-    with pytest.raises(ValueError):
-        ic_weights(signals, forward_returns)
+
+    weights = ic_weights(signals, forward_returns, min_periods=1)
+
+    assert weights["inverted"].isna().all()
 
 
 # ---------------------------------------------------------------------------
@@ -1158,42 +1318,56 @@ def test_combine_signals_equal_weight_averages_standardized_signals():
 
 
 def test_combine_signals_dispatches_to_inverse_vol_weights():
-    signal_a = pd.DataFrame({"A": [1.0], "B": [-1.0]}, index=_idx(1))
-    signal_b = pd.DataFrame({"A": [1.0], "B": [-1.0]}, index=_idx(1))
-    returns_a = pd.Series([0.01, -0.01, 0.02, -0.02], index=_idx(4))
+    idx = _idx(3)
+    signal_a = pd.DataFrame({"A": [1.0, 1.0, 1.0], "B": [-1.0, -1.0, -1.0]}, index=idx)
+    signal_b = pd.DataFrame({"A": [1.0, 1.0, 1.0], "B": [-1.0, -1.0, -1.0]}, index=idx)
+    returns_a = pd.Series([0.01, -0.01, 0.02], index=idx)
     returns_b = returns_a * 0.1
 
     combined = combine_signals(
         {"a": signal_a, "b": signal_b},
         method="inverse_vol",
         strategy_returns={"a": returns_a, "b": returns_b},
+        min_periods=2,
     )
-    # Both signals are identical, so they standardize to the same row
-    # (z-score of [1, -1] is [1/sqrt(2), -1/sqrt(2)]); whatever the weight
-    # split between "a" and "b", the combined row is still that same value
-    # since the weights sum to 1.
+
+    # Rows 0-1: both strategies' weights are undefined (not enough
+    # strictly-past history yet) -> the combined row stays NaN. Row 2: both
+    # signals are identical, so they standardize to the same row (z-score
+    # of [1, -1] is [1/sqrt(2), -1/sqrt(2)]); whatever the weight split
+    # between "a" and "b" turns out to be, the combined row is still that
+    # same value since the weights sum to 1.
     z = 1 / (2**0.5)
-    expected = pd.DataFrame({"A": [z], "B": [-z]}, index=_idx(1))
+    expected = pd.DataFrame(
+        {"A": [np.nan, np.nan, z], "B": [np.nan, np.nan, -z]}, index=idx
+    )
     pd.testing.assert_frame_equal(combined, expected)
 
 
 def test_combine_signals_dispatches_to_ic_weights():
+    idx = _idx(4)
     forward_returns = pd.DataFrame(
-        {"X": [0.01, 0.01], "Y": [0.02, 0.02], "Z": [0.03, 0.03]}, index=_idx(2)
+        {"X": [0.01] * 4, "Y": [0.02] * 4, "Z": [0.03] * 4}, index=idx
     )
     signal_a = pd.DataFrame(
-        {"X": [10.0, 10.0], "Y": [20.0, 20.0], "Z": [30.0, 30.0]}, index=_idx(2)
+        {"X": [10.0] * 4, "Y": [20.0] * 4, "Z": [30.0] * 4}, index=idx
     )
     signal_b = pd.DataFrame(
-        {"X": [30.0, 30.0], "Y": [10.0, 10.0], "Z": [20.0, 20.0]}, index=_idx(2)
+        {"X": [10.0] * 4, "Y": [30.0] * 4, "Z": [20.0] * 4}, index=idx
     )
+
     combined = combine_signals(
-        {"a": signal_a, "b": signal_b}, method="ic", forward_returns=forward_returns
+        {"a": signal_a, "b": signal_b},
+        method="ic",
+        forward_returns=forward_returns,
+        min_periods=1,
     )
-    expected_weights = ic_weights({"a": signal_a, "b": signal_b}, forward_returns)
-    expected = (
-        standardize_signal(signal_a) * expected_weights["a"]
-        + standardize_signal(signal_b) * expected_weights["b"]
+
+    expected_weights = ic_weights(
+        {"a": signal_a, "b": signal_b}, forward_returns, min_periods=1
+    )
+    expected = standardize_signal(signal_a).mul(expected_weights["a"], axis=0).add(
+        standardize_signal(signal_b).mul(expected_weights["b"], axis=0), fill_value=0.0
     )
     pd.testing.assert_frame_equal(combined, expected)
 
@@ -1268,13 +1442,22 @@ def test_annualized_volatility_scales_std_by_sqrt_periods():
 # ---------------------------------------------------------------------------
 # 6.3 sharpe_ratio
 # ---------------------------------------------------------------------------
-def test_sharpe_ratio_combines_annualized_return_and_vol():
-    returns = pd.Series([0.05, -0.05], index=_idx(2))
-    # total_growth = 1.05*0.95 = 0.9975 -> annualized_return (n=2, ppy=2) = -0.0025
-    # var (ddof=1) = (0.05^2+0.05^2)/1 = 0.005 -> annualized_vol = sqrt(0.005*2) = sqrt(0.01) = 0.1
-    # sharpe = -0.0025 / 0.1 = -0.025
+def test_sharpe_ratio_mean_over_std_formula():
+    # C1: mean(returns) / std(returns) * sqrt(periods_per_year) -- not the
+    # geometric annualized-return / annualized-vol figure this used to be.
+    returns = pd.Series([0.06, -0.04], index=_idx(2))
+    # mean = 0.01 ; std (ddof=1) = sqrt(((0.05)^2 + (-0.05)^2)/1) = sqrt(0.005)
+    # sharpe = 0.01/sqrt(0.005) * sqrt(2) = 0.01*sqrt(0.005^-1 * 2) = 0.01*sqrt(400) = 0.01*20 = 0.2
     result = sharpe_ratio(returns, periods_per_year=2)
-    assert result == pytest.approx(-0.025)
+    assert result == pytest.approx(0.2)
+
+
+def test_sharpe_ratio_subtracts_deannualized_risk_free_rate():
+    returns = pd.Series([0.06, -0.04], index=_idx(2))
+    # per-period risk-free = 0.04 / 2 = 0.02 ; excess mean = 0.01 - 0.02 = -0.01
+    # sharpe = -0.01/sqrt(0.005) * sqrt(2) = -0.01*20 = -0.2
+    result = sharpe_ratio(returns, periods_per_year=2, risk_free_rate=0.04)
+    assert result == pytest.approx(-0.2)
 
 
 def test_sharpe_ratio_nan_when_vol_is_zero():
@@ -1303,13 +1486,55 @@ def test_max_drawdown_is_series_minimum():
 # ---------------------------------------------------------------------------
 def test_alpha_beta_recovers_exact_linear_relationship():
     # strategy = 1.5 * benchmark + 0.002 exactly (no noise), so OLS should
-    # recover beta=1.5 and a per-period alpha of 0.002 exactly.
+    # recover beta=1.5 and a per-period alpha of 0.002 exactly. Residual
+    # variance is only ~0 up to floating-point roundoff (not exactly 0), so
+    # alpha's t-stat comes out enormous rather than NaN -- this is the
+    # "fit is as perfect as floating point allows" case, not the "residual
+    # variance is a true, exact zero" edge case (that's covered by the
+    # zero-standard-error branch directly, below). Correlation is exactly
+    # 1.0 either way (perfect fit, positive slope).
     benchmark = pd.Series([0.01, 0.02, -0.01, 0.03], index=_idx(4))
     strategy = 1.5 * benchmark + 0.002
 
-    alpha, beta = alpha_beta(strategy, benchmark, periods_per_year=1)
-    assert beta == pytest.approx(1.5)
-    assert alpha == pytest.approx(0.002)  # periods_per_year=1 -> no compounding effect
+    result = alpha_beta(strategy, benchmark, periods_per_year=1)
+    assert result.beta == pytest.approx(1.5)
+    assert result.alpha == pytest.approx(0.002)  # periods_per_year=1 -> no compounding effect
+    assert abs(result.alpha_t_stat) > 1e6
+    assert result.correlation == pytest.approx(1.0)
+
+
+def test_alpha_beta_alpha_t_stat_nan_when_standard_error_is_exactly_zero():
+    # Force the alpha_se == 0.0 branch directly (rather than relying on
+    # floating-point roundoff happening to land on exactly 0) by using
+    # integer-valued inputs an exact line fits through with zero residual.
+    benchmark = pd.Series([1.0, 2.0, 3.0], index=_idx(3))
+    strategy = pd.Series([2.0, 4.0, 6.0], index=_idx(3))  # = 2 * benchmark exactly
+
+    result = alpha_beta(strategy, benchmark, periods_per_year=1)
+    assert result.beta == pytest.approx(2.0)
+    assert result.alpha == pytest.approx(0.0)
+    assert np.isnan(result.alpha_t_stat)
+
+
+def test_alpha_beta_computes_t_stat_and_correlation_with_noise():
+    # Not a perfect fit, so there's real residual variance to compute a
+    # finite t-stat from.
+    benchmark = pd.Series([1.0, 2.0, 3.0, 4.0], index=_idx(4))
+    strategy = pd.Series([2.0, 3.0, 5.0, 6.0], index=_idx(4))
+
+    result = alpha_beta(strategy, benchmark, periods_per_year=1)
+
+    # cov(x,y) [ddof=1] = 7/3 ; var(x) = 5/3 -> beta = 7/5 = 1.4
+    # alpha_per_period = ybar(4.0) - beta*xbar(2.5) = 4.0 - 3.5 = 0.5 (ppy=1)
+    # fitted = 0.5 + 1.4*x -> residuals = [0.1, -0.3, 0.3, -0.1]
+    #   RSS = 0.01+0.09+0.09+0.01 = 0.20 ; residual_var = 0.20/(4-2) = 0.10
+    # alpha_se = sqrt(0.10 * (1/4 + 2.5^2/5.0)) = sqrt(0.10*1.5) = sqrt(0.15) = sqrt(15)/10
+    # t_stat = 0.5 / (sqrt(15)/10) = 5/sqrt(15) = sqrt(15)/3
+    # corr = cov/sqrt(var_x*var_y) = (7/3)/sqrt((5/3)*(10/3)) = 7/sqrt(50) = 7*sqrt(2)/10
+    assert result.beta == pytest.approx(1.4)
+    assert result.alpha == pytest.approx(0.5)
+    assert result.alpha_t_stat == pytest.approx(15**0.5 / 3)
+    assert result.correlation == pytest.approx(7 * 2**0.5 / 10)
 
 
 def test_alpha_beta_rejects_zero_variance_benchmark():
@@ -1320,8 +1545,8 @@ def test_alpha_beta_rejects_zero_variance_benchmark():
 
 
 def test_alpha_beta_rejects_insufficient_overlap():
-    benchmark = pd.Series([0.01], index=_idx(1))
-    strategy = pd.Series([0.02], index=_idx(1))
+    benchmark = pd.Series([0.01, 0.02], index=_idx(2))
+    strategy = pd.Series([0.02, 0.03], index=_idx(2))
     with pytest.raises(ValueError):
         alpha_beta(strategy, benchmark)
 
@@ -1330,15 +1555,15 @@ def test_alpha_beta_rejects_insufficient_overlap():
 # 6.6 / 6.7 build_performance_report
 # ---------------------------------------------------------------------------
 def test_build_performance_report_assembles_all_metrics():
-    net_returns = pd.Series([0.05, -0.05], index=_idx(2))
-    gross_returns = pd.Series([0.06, -0.04], index=_idx(2))
+    net_returns = pd.Series([0.05, -0.05, 0.02], index=_idx(3))
+    gross_returns = pd.Series([0.06, -0.04, 0.03], index=_idx(3))
     result = BacktestResult(
-        weights=pd.DataFrame({"A": [1.0, 1.0]}, index=_idx(2)),
-        turnover=pd.Series([1.0, 0.0], index=_idx(2)),
+        weights=pd.DataFrame({"A": [1.0, 1.0, 1.0]}, index=_idx(3)),
+        turnover=pd.Series([1.0, 0.0, 0.0], index=_idx(3)),
         gross_returns=gross_returns,
         net_returns=net_returns,
     )
-    # Benchmark identical to net_returns -> beta=1.0, alpha=0.0 exactly.
+    # Benchmark identical to net_returns -> beta=1.0, alpha=0.0, corr=1.0 exactly.
     benchmark = net_returns.copy()
 
     report = build_performance_report(result, periods_per_year=2, benchmark_returns=benchmark)
@@ -1352,6 +1577,8 @@ def test_build_performance_report_assembles_all_metrics():
     assert report.max_drawdown == pytest.approx(max_drawdown(net_returns))
     assert report.alpha == pytest.approx(0.0)
     assert report.beta == pytest.approx(1.0)
+    assert np.isnan(report.alpha_t_stat)  # zero residual variance -> undefined t-stat
+    assert report.correlation == pytest.approx(1.0)
 
 
 def test_build_performance_report_without_benchmark_leaves_alpha_beta_none():
@@ -1365,3 +1592,151 @@ def test_build_performance_report_without_benchmark_leaves_alpha_beta_none():
     report = build_performance_report(result)
     assert report.alpha is None
     assert report.beta is None
+    assert report.alpha_t_stat is None
+    assert report.correlation is None
+
+
+# =============================================================================
+# model_selection.py — C3/C4
+# =============================================================================
+
+
+# ---------------------------------------------------------------------------
+# split_prices
+# ---------------------------------------------------------------------------
+def test_split_prices_splits_chronologically_by_fraction():
+    idx = _idx(10)
+    prices = pd.DataFrame({"A": range(10)}, index=idx)
+    split = split_prices(prices, train_fraction=0.7)
+
+    assert len(split.train_prices) == 7
+    assert len(split.test_prices) == 3
+    assert split.split_date == idx[7]
+    assert list(split.train_prices.index) == list(idx[:7])
+    assert list(split.test_prices.index) == list(idx[7:])
+
+
+def test_split_prices_never_overlaps():
+    idx = _idx(10)
+    prices = pd.DataFrame({"A": range(10)}, index=idx)
+    split = split_prices(prices, train_fraction=0.5)
+    assert split.train_prices.index.max() < split.test_prices.index.min()
+
+
+def test_split_prices_clamps_to_at_least_one_bar_each_side():
+    idx = _idx(3)
+    prices = pd.DataFrame({"A": range(3)}, index=idx)
+    # train_fraction=0.01 would naively round down to 0 train bars -> clamp to 1.
+    split = split_prices(prices, train_fraction=0.01)
+    assert len(split.train_prices) == 1
+    assert len(split.test_prices) == 2
+
+    # train_fraction=0.99 would naively round up to all 3 bars in train,
+    # leaving none for test -> clamp to leave at least 1 test bar.
+    split = split_prices(prices, train_fraction=0.99)
+    assert len(split.train_prices) == 2
+    assert len(split.test_prices) == 1
+
+
+def test_split_prices_rejects_invalid_train_fraction():
+    prices = pd.DataFrame({"A": range(5)}, index=_idx(5))
+    with pytest.raises(ValueError):
+        split_prices(prices, train_fraction=0.0)
+    with pytest.raises(ValueError):
+        split_prices(prices, train_fraction=1.0)
+
+
+def test_split_prices_rejects_too_few_bars():
+    prices = pd.DataFrame({"A": [1.0]}, index=_idx(1))
+    with pytest.raises(ValueError):
+        split_prices(prices, train_fraction=0.5)
+
+
+# ---------------------------------------------------------------------------
+# generate_walk_forward_folds
+# ---------------------------------------------------------------------------
+def test_generate_walk_forward_folds_expanding_window_and_full_coverage():
+    # n=20, initial_train_fraction=0.5 -> initial_train_end=10, remaining=10,
+    # split into 4 folds -> boundaries [12, 15, 18, 20] (hand-verified via
+    # Python's round(), which is round-half-to-even).
+    idx = _idx(20)
+    prices = pd.DataFrame({"A": range(20)}, index=idx)
+
+    folds = generate_walk_forward_folds(prices, n_folds=4, initial_train_fraction=0.5)
+
+    assert len(folds) == 4
+    expected_train_len = [10, 12, 15, 18]
+    expected_test_len = [2, 3, 3, 2]
+    for i, fold in enumerate(folds):
+        assert len(fold.train_prices) == expected_train_len[i]
+        assert len(fold.test_prices) == expected_test_len[i]
+        # Expanding: each fold's train window is exactly the previous
+        # fold's train window plus its test window (anchored, not rolling).
+        if i > 0:
+            assert list(fold.train_prices.index) == list(folds[i - 1].train_prices.index) + list(
+                folds[i - 1].test_prices.index
+            )
+
+    # No bar dropped or duplicated: every fold's test block end to end
+    # reconstructs exactly the remaining (post-initial-train) history.
+    reconstructed = pd.concat([fold.test_prices for fold in folds])
+    pd.testing.assert_index_equal(reconstructed.index, idx[10:])
+
+
+def test_generate_walk_forward_folds_rejects_invalid_inputs():
+    prices = pd.DataFrame({"A": range(20)}, index=_idx(20))
+    with pytest.raises(ValueError):
+        generate_walk_forward_folds(prices, initial_train_fraction=0.0)
+    with pytest.raises(ValueError):
+        generate_walk_forward_folds(prices, initial_train_fraction=1.0)
+    with pytest.raises(ValueError):
+        generate_walk_forward_folds(prices, n_folds=0)
+
+
+def test_generate_walk_forward_folds_rejects_too_many_folds_for_remaining_bars():
+    prices = pd.DataFrame({"A": range(10)}, index=_idx(10))
+    # initial_train_fraction=0.9 -> only 1 bar remains, can't make 5 folds from it.
+    with pytest.raises(ValueError):
+        generate_walk_forward_folds(prices, n_folds=5, initial_train_fraction=0.9)
+
+
+# ---------------------------------------------------------------------------
+# select_best
+# ---------------------------------------------------------------------------
+def test_select_best_picks_highest_score():
+    assert select_best({"a": 1.0, "b": 2.5, "c": -1.0}) == "b"
+
+
+def test_select_best_skips_nan_scores():
+    assert select_best({"a": np.nan, "b": 0.5}) == "b"
+
+
+def test_select_best_rejects_all_nan():
+    with pytest.raises(ValueError):
+        select_best({"a": np.nan, "b": np.nan})
+
+
+def test_select_best_rejects_empty():
+    with pytest.raises(ValueError):
+        select_best({})
+
+
+# ---------------------------------------------------------------------------
+# slice_backtest_result
+# ---------------------------------------------------------------------------
+def test_slice_backtest_result_restricts_every_field():
+    idx = _idx(5)
+    result = BacktestResult(
+        weights=pd.DataFrame({"A": range(5), "B": range(5, 10)}, index=idx),
+        turnover=pd.Series(range(5), index=idx, dtype=float),
+        gross_returns=pd.Series(range(5), index=idx, dtype=float),
+        net_returns=pd.Series(range(5), index=idx, dtype=float),
+    )
+    sub_index = idx[2:4]
+
+    sliced = slice_backtest_result(result, sub_index)
+
+    pd.testing.assert_frame_equal(sliced.weights, result.weights.loc[sub_index])
+    pd.testing.assert_series_equal(sliced.turnover, result.turnover.loc[sub_index])
+    pd.testing.assert_series_equal(sliced.gross_returns, result.gross_returns.loc[sub_index])
+    pd.testing.assert_series_equal(sliced.net_returns, result.net_returns.loc[sub_index])
