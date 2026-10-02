@@ -108,6 +108,28 @@ def correlation_reversal(
 # ---------------------------------------------------------------------------
 # 3.4 Macro-regime-conditioned reversal
 # ---------------------------------------------------------------------------
+def _expanding_percentile_rank(series: pd.Series) -> pd.Series:
+    """Percentile rank of each value against only its own history up to and
+    including that point (an expanding window).
+
+    Unlike ``Series.rank(pct=True)``, which ranks every value against the
+    *entire* series — including points after it — this never looks past
+    bar t to answer "how elevated is this value, as of bar t" (B3 in
+    specs/methodology-fixes-scope.md). An expanding window is used rather
+    than a rolling one so there's no extra lookback length to pick: every
+    bar simply uses everything knowable about the indicator up to itself.
+    """
+    values = series.to_numpy()
+    out = np.full(len(values), np.nan)
+    for t in range(len(values)):
+        if np.isnan(values[t]):
+            continue
+        window = values[: t + 1]
+        valid = window[~np.isnan(window)]
+        out[t] = (valid <= values[t]).mean()
+    return pd.Series(out, index=series.index)
+
+
 def macro_conditioned_reversal(
     prices: pd.DataFrame,
     lookback: int,
@@ -123,15 +145,17 @@ def macro_conditioned_reversal(
     ready-made ``realized_volatility_indicator`` /
     ``return_dispersion_indicator`` / ``average_pairwise_correlation_indicator``
     implementations of three of these (implied volatility needs options
-    data this project doesn't ingest). The base reversal signal is multiplied by
-    the indicator's rolling-rank (0-1) so reversal is stronger when the
-    indicator is elevated relative to its own history, and floored to zero
-    below ``dislocation_threshold_quantile`` so the signal is only active in
-    sufficiently dislocated regimes.
+    data this project doesn't ingest). The base reversal signal is multiplied
+    by the indicator's *expanding* historical percentile (0-1, via
+    ``_expanding_percentile_rank`` — using only the indicator's own history
+    up to and including that bar, never later bars) so reversal is stronger
+    when the indicator is elevated relative to its own history so far, and
+    floored to zero below ``dislocation_threshold_quantile`` so the signal
+    is only active in sufficiently dislocated regimes.
     """
     reversal = time_horizon_reversal(prices, lookback)
     indicator = dislocation_indicator.reindex(prices.index)
-    percentile_rank = indicator.rank(pct=True)
+    percentile_rank = _expanding_percentile_rank(indicator)
 
     active = percentile_rank >= dislocation_threshold_quantile
     scale = percentile_rank.where(active, 0.0)

@@ -28,6 +28,9 @@ because each is independently useful and independently tested.
 ``load_multi_exchange_universe`` is the same thing across several
 exchanges at once — literal "multi-exchange" ingestion (1.1) — merging one
 ``DataRequest`` per exchange into a single symbol -> data mapping.
+``build_close_price_panel`` reshapes either loader's result into the wide
+(time x symbol) close-price ``DataFrame`` the signal and backtest layers
+consume.
 """
 
 from __future__ import annotations
@@ -295,6 +298,30 @@ def load_universe_ohlcv(
 ) -> dict[str, tuple[pd.DataFrame, ValidationReport]]:
     """``load_symbol_ohlcv`` for every symbol in ``request.symbols``."""
     return {symbol: load_symbol_ohlcv(request, symbol, **kwargs) for symbol in request.symbols}
+
+
+def build_close_price_panel(
+    universe: dict[str, tuple[pd.DataFrame, ValidationReport]],
+    require_sufficient_history: bool = True,
+) -> pd.DataFrame:
+    """Combine a ``load_universe_ohlcv`` / ``load_multi_exchange_universe``
+    result into one wide close-price panel (time x symbol) — the shape every
+    function in ``quant_project.signals`` and ``quant_project.backtest``
+    expects.
+
+    Symbols ``validate_ohlcv`` flagged ``has_sufficient_history=False`` are
+    dropped by default (``require_sufficient_history=True``) rather than
+    silently included with too little history to compute lookback-based
+    signals on.
+    """
+    columns = {
+        symbol: df["close"]
+        for symbol, (df, report) in universe.items()
+        if not require_sufficient_history or report.has_sufficient_history
+    }
+    if not columns:
+        raise ValueError("no symbol had sufficient history to build a price panel")
+    return pd.DataFrame(columns).sort_index()
 
 
 def load_multi_exchange_universe(
