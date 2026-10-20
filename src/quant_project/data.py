@@ -30,7 +30,8 @@ exchanges at once — literal "multi-exchange" ingestion (1.1) — merging one
 ``DataRequest`` per exchange into a single symbol -> data mapping.
 ``build_close_price_panel`` reshapes either loader's result into the wide
 (time x symbol) close-price ``DataFrame`` the signal and backtest layers
-consume.
+consume; ``build_field_panel`` does the same for any other OHLCV column
+(e.g. volume, for the activity-conditioned signals).
 """
 
 from __future__ import annotations
@@ -119,6 +120,24 @@ def build_exchange_client(exchange_id: str) -> Any:
     return exchange_class({"enableRateLimit": True})
 
 
+def drop_incomplete_bars(
+    frame: pd.DataFrame, timeframe: str, now: pd.Timestamp | None = None
+) -> pd.DataFrame:
+    """Drop bars whose period hasn't closed yet as of ``now`` (UTC).
+
+    An exchange happily returns the bar that is still forming (e.g. today's
+    daily candle, with a "close" that is really just the latest trade).
+    Such a bar must never reach the cache: once cached, a later run would
+    treat that provisional close as final. A bar indexed at ``t`` (its open
+    time, as ccxt reports it) is complete once ``t + bar length <= now``.
+    ``now`` defaults to the current UTC time; tests pass a fixed one.
+    """
+    if now is None:
+        now = pd.Timestamp.now(tz="UTC").tz_localize(None)
+    bar_length = pd.Timedelta(SUPPORTED_TIMEFRAMES[timeframe])
+    return frame[frame.index + bar_length <= now]
+
+
 def fetch_ohlcv_from_exchange(
     exchange: Any,
     symbol: str,
@@ -126,6 +145,7 @@ def fetch_ohlcv_from_exchange(
     start: pd.Timestamp,
     end: pd.Timestamp,
     limit: int = 1000,
+    now: pd.Timestamp | None = None,
 ) -> pd.DataFrame:
     """Fetch OHLCV for one symbol over [start, end], paginating as needed.
 
@@ -134,6 +154,7 @@ def fetch_ohlcv_from_exchange(
     volume]`` rows — a real ``ccxt`` client, or a test double. Pagination
     stops once a page starts at or before its own cursor (the exchange
     isn't advancing) or returns fewer than ``limit`` rows (no more data).
+    Bars still forming as of ``now`` are dropped (``drop_incomplete_bars``).
     """
     since_ms = int(pd.Timestamp(start).timestamp() * 1000)
     until_ms = int(pd.Timestamp(end).timestamp() * 1000)
@@ -157,6 +178,7 @@ def fetch_ohlcv_from_exchange(
     frame = pd.DataFrame(rows, columns=["timestamp", *OHLCV_COLUMNS])
     frame["timestamp"] = pd.to_datetime(frame["timestamp"], unit="ms")
     frame = frame.set_index("timestamp").sort_index()
+    frame = drop_incomplete_bars(frame, timeframe, now=now)
     return frame.loc[pd.Timestamp(start) : pd.Timestamp(end)]
 
 
@@ -249,8 +271,12 @@ def load_symbol_ohlcv(
     Reuses the cache when it already covers ``[request.start, request.end]``
     (1.4); otherwise fetches from the exchange (building a rate-limited
     client via ``build_exchange_client`` if none was supplied), merges with
-    whatever was already cached, and rewrites the cache. Every call is
-    audit-logged (7.4) unless ``audit_log_path`` is None.
+    whatever was already cached, and rewrites the cache. On that merge a
+    freshly fetched bar replaces a cached bar with the same timestamp —
+    the fresh copy is the more recent (and possibly corrected) one, and
+    letting the cached copy win would also let duplicates pile up in the
+    cache file run after run. Every call is audit-logged (7.4) unless
+    ``audit_log_path`` is None.
     """
     path = cache_path(request.exchange_id, symbol, request.timeframe, cache_dir)
     cached = None if force_refresh else read_cache(path)
@@ -263,7 +289,11 @@ def load_symbol_ohlcv(
         fetched = fetch_ohlcv_from_exchange(
             exchange, symbol, request.timeframe, request.start, request.end
         )
-        raw = fetched if cached is None else pd.concat([cached, fetched])
+        if cached is None:
+            raw = fetched
+        else:
+            stale = cached.index.isin(fetched.index)
+            raw = pd.concat([cached[~stale], fetched]).sort_index()
         write_cache(raw, path)
         source = "fetched"
 
@@ -300,28 +330,39 @@ def load_universe_ohlcv(
     return {symbol: load_symbol_ohlcv(request, symbol, **kwargs) for symbol in request.symbols}
 
 
-def build_close_price_panel(
+def build_field_panel(
     universe: dict[str, tuple[pd.DataFrame, ValidationReport]],
+    field: str,
     require_sufficient_history: bool = True,
 ) -> pd.DataFrame:
-    """Combine a ``load_universe_ohlcv`` / ``load_multi_exchange_universe``
-    result into one wide close-price panel (time x symbol) — the shape every
-    function in ``quant_project.signals`` and ``quant_project.backtest``
-    expects.
+    """Combine one OHLCV column (``field``, e.g. "close" or "volume") of a
+    ``load_universe_ohlcv`` / ``load_multi_exchange_universe`` result into
+    one wide panel (time x symbol) — the shape every function in
+    ``quant_project.signals`` and ``quant_project.backtest`` expects.
 
     Symbols ``validate_ohlcv`` flagged ``has_sufficient_history=False`` are
     dropped by default (``require_sufficient_history=True``) rather than
     silently included with too little history to compute lookback-based
     signals on.
     """
+    if field not in OHLCV_COLUMNS:
+        raise ValueError(f"Unknown OHLCV field: {field!r} (expected one of {OHLCV_COLUMNS})")
     columns = {
-        symbol: df["close"]
+        symbol: df[field]
         for symbol, (df, report) in universe.items()
         if not require_sufficient_history or report.has_sufficient_history
     }
     if not columns:
         raise ValueError("no symbol had sufficient history to build a price panel")
     return pd.DataFrame(columns).sort_index()
+
+
+def build_close_price_panel(
+    universe: dict[str, tuple[pd.DataFrame, ValidationReport]],
+    require_sufficient_history: bool = True,
+) -> pd.DataFrame:
+    """``build_field_panel`` for the close price — the panel most callers want."""
+    return build_field_panel(universe, "close", require_sufficient_history)
 
 
 def load_multi_exchange_universe(

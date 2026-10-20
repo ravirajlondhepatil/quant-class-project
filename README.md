@@ -1,135 +1,80 @@
-# quant-class-project
+# Does momentum or reversal make money in crypto after trading costs?
 
-Statistical arbitrage research in cryptocurrencies (momentum & reversal
-strategies) — Wall Street Quants course project.
+A research project from the Wall Street Quants course. I tested cross-sectional momentum and reversal on 15 liquid coins traded on Binance, using daily bars from 1 January 2023 to 19 October 2026. The full write-up, with every number computed live, is in [`notebooks/performance_summary.ipynb`](notebooks/performance_summary.ipynb).
 
-- Course brief: [`ref/ClassProject.docx`](ref/ClassProject.docx)
-- Specs (requirement / design / implementation / technical / feature list):
-  [`specs/`](specs/)
+## Short answer
 
-## Status
+No. At the course's assumed cost of 20 bps per trade, every strategy in the train/test comparison below loses money in both periods.
 
-Phase 1 (Data Infrastructure) — done: `ccxt`-based exchange OHLCV loader,
-local parquet cache with freshness checks, and data validation (duplicate
-removal, gap detection, insufficient-history flagging)
-(`src/quant_project/data.py`). Rate limiting relies on `ccxt`'s own
-`enableRateLimit`, not a hand-rolled limiter. `main.py` and the notebook
-now run on real Binance data for a 15-coin universe (`build_close_price_panel`),
-not synthetic data — see `specs/methodology-fixes-scope.md` item A.
+The more useful finding is why. Before costs, all four main strategies are flat or positive on the training data. After costs, none is. **Costs, not the direction of the signal, decide every result here.** The clearest case is 1-day reversal. Its net Sharpe of −4 looked like a strong (if backwards) signal, but before costs its training Sharpe is +0.04. It trades 1.4 times its book every day, and at 20 bps that costs about 100% a year.
 
-Phase 2 (Signal Research) — done: momentum signals
-(`src/quant_project/signals/momentum.py`) and reversal signals
-(`src/quant_project/signals/reversal.py`).
+21-day momentum is the one signal I'd keep working on. It's positive before costs in both periods, and its breakeven cost holds steady at 16 to 17 bps per unit traded. That's just under the 20 bps it pays.
 
-Phase 3 (Backtesting & Cost Modeling) — done: unconstrained backtest engine
-and execution cost model (`src/quant_project/backtest.py`,
-`src/quant_project/costs.py`) and strategy weighting/combination
-(`src/quant_project/combination.py` — equal-weight, inverse-volatility,
-and IC-weighted combination of multiple strategy signals).
+## Before vs. after costs
 
-Phase 4 (Performance Reporting) — done: performance metrics and historical
-view (`src/quant_project/performance.py` — cumulative gross/net returns,
-annualized return/volatility, Sharpe ratio (arithmetic-mean-based, per
-`specs/methodology-fixes-scope.md` C1), drawdown, and alpha/beta vs. a
-benchmark, plus alpha's t-statistic and strategy/benchmark correlation,
-C2) and a performance summary notebook
-(`notebooks/performance_summary.ipynb`, matplotlib charts + a metrics
-table — needs the `notebooks` dependency group, see Setup).
-Train/test split and parameter selection (`src/quant_project/model_selection.py`
-— C3/C4): momentum lookback, EMA fast/slow pair, and combination method
-are each chosen by training-period Sharpe only, then every strategy is
-reported separately in-sample and out-of-sample, both in `main.py` and
-the notebook. The notebook (D1) leads with a stated hypothesis and
-economic rationale per strategy and an overall research conclusion —
-none of the three signals shows a real, cost-surviving out-of-sample
-edge in this universe/period — pushing the metrics table/charts to an
-appendix; see `specs/methodology-fixes-scope.md` section D for the full
-writeup.
+| Strategy | Sharpe before costs | Sharpe after 20 bps | Breakeven cost (bps) | Turnover per day |
+|---|---|---|---|---|
+| 21-day momentum | +0.78 / +0.47 | −0.13 / −0.11 | 17 / 16 | 0.30 / 0.29 |
+| EMA crossover (16/48) | +0.48 / −0.55 | −0.01 / −1.03 | 20 / −23 | 0.11 / 0.11 |
+| 1-day reversal | +0.04 / −1.26 | −3.99 / −3.90 | 0 / −10 | 1.40 / 1.42 |
+| 1-day momentum (reversal flipped) | −0.04 / +1.26 | −4.09 / −1.38 | 0 / 10 | 1.40 / 1.42 |
+| Combined (inverse-vol weights) | +0.59 / −0.87 | −1.55 / −3.24 | 6 / −7 | 0.65 / 0.74 |
 
-Phase 5 (Data Integrity & Reproducibility, cross-cutting) — done: input
-validation on run configuration (`DataRequest` in `data.py`, and now
-literal multi-exchange ingestion via `load_multi_exchange_universe`), rate
-limiting (`ccxt`'s `enableRateLimit`), deterministic parquet caching, and
-run/parameter audit logging (`src/quant_project/audit.py`, an append-only
-JSON-Lines file at `data/audit_log.jsonl`). Macro-reversal's dislocation
-indicators (`signals/indicators.py`) cover realized volatility, return
-dispersion, and average pairwise correlation from spot OHLCV; implied
-volatility is out of scope — it needs options market data this project
-doesn't ingest.
-All of the above are tested in `tests/test_quant_project.py`.
-See [`specs/implementation-spec.md`](specs/implementation-spec.md) for the
-full checklist; boxes are ticked there as each item is finished.
+Each cell is training / test. Breakeven cost is the cost per unit traded at which a strategy would exactly break even, so a strategy with a breakeven below 20 bps loses money on market orders, and one below 7 bps loses even on limit orders. Turnover is the fraction of the book traded each day. Every Sharpe here has a 95% confidence interval of roughly ±1.1 in training and ±1.8 in test (the notebook prints each one), and before costs every interval includes zero.
 
-Project tooling is set up: `uv` for dependency/environment management,
-`ruff` for linting, `pytest` + `pytest-cov` for testing and coverage.
+![Cumulative returns before and after costs for the four main strategies](docs/gross_vs_net.png)
 
-## Setup
+## How it was tested
 
-```bash
-uv sync            # creates .venv/ and installs dependencies
-uv sync --group notebooks   # also installs jupyter/matplotlib for notebooks/
-```
+The first 70% of the sample (up to 29 August 2025) is the training period and the last 30% is the test period. The momentum lookback, the EMA pair and the way the signals are combined were all chosen on training data, and the test period was only used to judge those choices. Portfolios are dollar-neutral long-short. Positions are set at each daily close from data up to that close and held to the next one. Costs follow the course brief: 7 bps commission plus 13 bps slippage on market orders, 7 bps on limit orders.
 
-## Common commands
+A 5-fold walk-forward search (`optimize.py`) re-picks the parameters fold by fold. Its best out-of-sample result, EMA crossover at a net Sharpe of +0.20 (alpha t-stat 0.27), can't be told apart from zero.
+
+## How much of this could be luck?
+
+Quite a lot, and I've tried to measure it.
+
+**Error bars.** Each Sharpe ratio gets a 95% interval from a block bootstrap (daily returns resampled in ten-day blocks, 5,000 times). With under three years of training data the intervals are wide: 21-day momentum's +0.78 before costs could be anything from −0.35 to +1.89. Every interval before costs includes zero. The only statistically clear results are losses, from the fast strategies after costs.
+
+**The search.** Counting every configuration the project's scripts have backtested gives 34 trials. They overlap heavily, since most are one trend bet at different speeds, and their correlations put them at about four independent ideas. The best net result anywhere is EMA crossover 32/96, at +0.61 over the full sample, so I ran it through a deflated Sharpe ratio test (Bailey and López de Prado, 2014), which asks whether it beats what the best of N no-edge strategies would show by luck. Its chance of being real comes out between 17% (N = 34) and 55% (N = 4). The usual bar is 95%.
+
+## The 1-day result, checked before believing it
+
+My course mentor suggested flipping 1-day reversal into 1-day momentum, and it was the obvious thing to try. It doesn't help. Turnover and cost are the same in either direction, and in training neither direction has an edge. The flipped trade does make money before costs in the test period, but:
+
+- 57% of that profit came from one coin on one day: FIL/USDT on 7 November 2025, the day after a 35% jump, when the strategy held 42% of its book in FIL. The prices are real (OKX and Kraken show the same move).
+- Taking out the 5 best test days, about 1% of them, drops its gross Sharpe from +1.26 to −0.10. Trading one day late drops it to +0.05.
+- It isn't a bull-market effect. In training it did worse on up-trend days (−0.55) than on down-trend days (+0.19).
+- Volume doesn't rescue it. Momentum among high-volume coins minus momentum among low-volume coins has a t-stat of −2.1 in training and +1.7 in test, so the sign flips between periods.
+
+The walk-forward optimiser points the same way from the other side. It almost always picked the lowest-turnover option on each grid, which is what a search does when the cheapest signal to trade wins.
+
+## Limitations
+
+- **The universe was picked with hindsight.** I chose these 15 coins in 2026, and SOL alone went from $9.99 on the first day of the sample to $105 on the last. Coins delisted during the sample, like WAVES, MULTI and ANT, can't be in it at all.
+- **The evidence is thin.** None of the positive results before costs has a t-stat of 2 or more. At a Sharpe of 0.78 you'd need about 6½ years of data to get there, and this sample is under 4.
+- **The test period isn't fresh any more.** It has informed several decisions now, so the next test has to be judged on data the project hasn't seen.
+- **Costs are flat.** BTC and FIL pay the same 20 bps, which flatters small coins and penalises big ones. Limit orders are an optimistic way out for momentum, too, because a resting order mostly fills when the price comes back against you.
+- **Shorting is free in the backtest.** In practice the short side would go through perpetual futures, which pay or charge funding, and that isn't modelled.
+- One exchange, daily bars only.
+
+## Next steps
+
+1. Rebuild the universe point-in-time: each month, the top 50 or so USDT pairs by trailing 30-day dollar volume, including coins that were later delisted. Binance's public archive at data.binance.vision still has their price history.
+2. Test one cost-aware version of 21-day momentum, written down before it's run. It would move only part of the way towards its target weights each day (Gârleanu and Pedersen, 2013), with positions scaled by rank and volatility. With breakeven at 16 to 17 bps against 20 bps of cost, trading less is the one economically sensible route to a positive result. It gets judged once, on coins and dates the project hasn't touched.
+
+## Reproduce
 
 ```bash
-uv run pytest      # run tests with coverage
-uv run ruff check . # lint
-uv run python main.py  # real data -> train/test split + param selection -> backtest -> combination -> report
-uv run python optimize.py  # wider walk-forward parameter search (5 folds) -- see its own docstring
+uv sync                                    # Python 3.12+, managed with uv
+uv run python main.py                      # train/test split, parameter selection, report
+uv run python short_horizon_study.py       # the 1-day follow-up experiments
+uv run python optimize.py                  # 5-fold walk-forward search
+uv run python overfitting_check.py         # error bars, trial count, deflated Sharpe ratio
+uv run --group notebooks jupyter nbconvert --to notebook --execute --inplace notebooks/performance_summary.ipynb
+uv run pytest
 ```
 
-`optimize.py` is a separate, exploratory follow-up to `main.py`: it widens
-the lookback/EMA/combination-method search and re-selects across 5
-sequential walk-forward folds instead of one static split, reporting the
-concatenated out-of-sample result as the honest number. As of the last
-run, the answer is still "no cost-surviving edge" — if anything, the
-walk-forward view makes the finding *stronger*: 1-day-ish reversal is
-significantly negative in every single fold, not just one split, while
-momentum/EMA crossover flip sign fold to fold (unstable, consistent with
-chasing noise rather than a real effect). Widening the search further
-doesn't bypass that; see the script's own docstring for the
-multiple-comparisons caveat.
+The first run downloads daily data from Binance (no API key needed) and caches it in `data/raw/`. The sample end is pinned in `main.py`, so every run sees the same data, and re-running the notebook also redraws the chart above.
 
-## Notebooks
-
-`notebooks/performance_summary.ipynb` runs the signals → backtest →
-combination → performance-report pipeline and charts the results
-(cumulative returns, drawdown, and a metrics table). It needs the
-`notebooks` dependency group (`uv sync --group notebooks`, see Setup).
-
-To open and run it interactively:
-
-```bash
-uv run --group notebooks jupyter lab notebooks/performance_summary.ipynb
-```
-
-This starts Jupyter using the project's venv, so `quant_project` and its
-dependencies are already importable — no separate kernel setup needed.
-Once it's open, **Kernel → Restart & Run All** re-runs every cell from
-scratch.
-
-To re-run it headlessly and refresh its saved output (e.g. after changing
-signal, backtest, or combination code) without opening a browser:
-
-```bash
-uv run --group notebooks jupyter nbconvert --to notebook --execute --inplace \
-  notebooks/performance_summary.ipynb
-```
-
-The notebook loads the same real Binance data `main.py` uses (a 15-coin
-daily-OHLCV universe since 2023-01-01, cached locally after the first
-fetch) — running either one for the first time needs network access; both
-reuse the cache afterward.
-
-## Project layout
-
-```
-src/quant_project/   # package source
-tests/               # tests, mirroring src/quant_project/
-notebooks/           # performance summary notebook (needs `--group notebooks`)
-data/raw/            # cached OHLCV parquet files (git-ignored)
-data/audit_log.jsonl # run/parameter audit trail (git-ignored)
-specs/               # requirement/design/implementation/technical specs
-ref/                 # original course brief
-```
+Under the hood: a ccxt data pipeline with validation and a parquet cache, a backtester that lags positions and charges costs on turnover, three ways to combine signals, performance and alpha statistics, and an audit log of every run, all in `src/quant_project/` with 135 tests at 99% coverage.
