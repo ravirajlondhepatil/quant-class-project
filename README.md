@@ -15,7 +15,10 @@ removal, gap detection, insufficient-history flagging)
 (`src/quant_project/data.py`). Rate limiting relies on `ccxt`'s own
 `enableRateLimit`, not a hand-rolled limiter. `main.py` and the notebook
 now run on real Binance data for a 15-coin universe (`build_close_price_panel`),
-not synthetic data — see `specs/methodology-fixes-scope.md` item A.
+not synthetic data — see `specs/methodology-fixes-scope.md` item A. The
+sample is pinned (`main.py`'s `START`/`END`, 2023-01-01 to 2026-10-19) so
+every script and the notebook see identical data, and bars still forming
+when fetched are never cached (`drop_incomplete_bars`).
 
 Phase 2 (Signal Research) — done: momentum signals
 (`src/quant_project/signals/momentum.py`) and reversal signals
@@ -41,10 +44,20 @@ are each chosen by training-period Sharpe only, then every strategy is
 reported separately in-sample and out-of-sample, both in `main.py` and
 the notebook. The notebook (D1) leads with a stated hypothesis and
 economic rationale per strategy and an overall research conclusion —
-none of the three signals shows a real, cost-surviving out-of-sample
-edge in this universe/period — pushing the metrics table/charts to an
-appendix; see `specs/methodology-fixes-scope.md` section D for the full
-writeup.
+no signal shows a cost-surviving out-of-sample edge in this
+universe/period, and transaction costs (not signal direction) are why:
+every strategy is flat-to-positive *before* costs in training — pushing
+the metrics table/charts to an appendix; see
+`specs/methodology-fixes-scope.md` section D for the full writeup.
+
+Mentor review 2 follow-up — done: `short_horizon_study.py` runs the
+review's suggestions as pre-specified experiments (no parameter search):
+flipping 1-day reversal into 1-day momentum, decomposing its result
+(gross vs. net, turnover, breakeven cost, by coin, by year, best days,
+robustness checks), and a volume-conditioned extension
+(`informed_momentum` / `uninformed_reversal`). Its tables appear in the
+notebook's Follow-up section; `costs.breakeven_cost_bps` is the summary
+metric throughout.
 
 Phase 5 (Data Integrity & Reproducibility, cross-cutting) — done: input
 validation on run configuration (`DataRequest` in `data.py`, and now
@@ -77,6 +90,7 @@ uv run pytest      # run tests with coverage
 uv run ruff check . # lint
 uv run python main.py  # real data -> train/test split + param selection -> backtest -> combination -> report
 uv run python optimize.py  # wider walk-forward parameter search (5 folds) -- see its own docstring
+uv run python short_horizon_study.py  # mentor review 2: flip/scrutinize the 1-day result, volume test
 ```
 
 `optimize.py` is a separate, exploratory follow-up to `main.py`: it widens

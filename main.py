@@ -60,6 +60,14 @@ SYMBOLS = [
 ]
 TIMEFRAME = "1d"
 START = "2023-01-01"
+END = "2026-10-19"
+"""Last daily bar in the sample, pinned rather than "today" so every run --
+this script, optimize.py, the notebook -- sees the identical sample and
+the identical train/test boundary. With a moving end date, two runs a few
+days apart select from different data, which is how the saved notebook
+once printed one selected combination method but reported another.
+Move this forward deliberately (and re-run everything) to extend the
+sample."""
 BENCHMARK_SYMBOL = "BTC/USDT"  # per specs/requirement-spec.md: "e.g. BTC"
 
 TRAIN_FRACTION = 0.7
@@ -73,13 +81,18 @@ they're a handful of round, commonly-used choices to select among, not a
 claim that these are the only lookbacks/spans worth trying."""
 
 
+def load_universe() -> dict:
+    """Real daily OHLCV for ``SYMBOLS`` from ``EXCHANGE_ID``, ``START`` to
+    ``END`` — cached locally (``quant_project.data``) after the first fetch.
+    Returned in ``load_universe_ohlcv``'s symbol -> (data, report) shape, so
+    callers can build whichever panels they need (close, volume, ...)."""
+    request = DataRequest(EXCHANGE_ID, SYMBOLS, TIMEFRAME, START, END)
+    return load_universe_ohlcv(request)
+
+
 def load_prices() -> pd.DataFrame:
-    """Real daily close prices for ``SYMBOLS`` from ``EXCHANGE_ID``, up to
-    today — cached locally (``quant_project.data``) after the first fetch."""
-    end = pd.Timestamp.now().normalize()
-    request = DataRequest(EXCHANGE_ID, SYMBOLS, TIMEFRAME, START, end)
-    universe = load_universe_ohlcv(request)
-    return build_close_price_panel(universe)
+    """Daily close-price panel (time x symbol) for the pinned sample."""
+    return build_close_price_panel(load_universe())
 
 
 def _score_on_train(net_returns: pd.Series, split) -> float:

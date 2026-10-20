@@ -56,3 +56,20 @@ def net_of_costs(
 ) -> pd.Series:
     """Strategy returns after subtracting estimated execution costs."""
     return gross_returns - apply_transaction_costs(turnover, order_type=order_type)
+
+
+def breakeven_cost_bps(gross_returns: pd.Series, turnover: pd.Series) -> float:
+    """The all-in cost per unit of turnover, in bps, at which the strategy's
+    average net return would be exactly zero: mean gross return divided by
+    mean turnover.
+
+    This compares a signal against costs without first picking an order type
+    or cost level. A signal whose gross edge is worth 3 bps per unit traded
+    can't pay 7 bps (limit) or 20 bps (market), however good its gross
+    Sharpe looks. Negative means the signal loses money even before costs.
+    NaN if the strategy never trades.
+    """
+    mean_turnover = turnover.mean()
+    if not mean_turnover > 0.0:
+        return float("nan")
+    return gross_returns.mean() / mean_turnover * 10_000.0
