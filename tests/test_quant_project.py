@@ -11,6 +11,7 @@ numbers, not just confirm it runs.
 from __future__ import annotations
 
 from pathlib import Path
+from statistics import NormalDist
 
 import numpy as np
 import pandas as pd
@@ -34,6 +35,7 @@ from quant_project.costs import (
     LIMIT_ORDER_COST_BPS,
     MARKET_ORDER_COST_BPS,
     apply_transaction_costs,
+    breakeven_cost_bps,
     cost_bps_for,
     net_of_costs,
 )
@@ -43,7 +45,9 @@ from quant_project.data import (
     ValidationReport,
     build_close_price_panel,
     build_exchange_client,
+    build_field_panel,
     cache_path,
+    drop_incomplete_bars,
     fetch_ohlcv_from_exchange,
     is_cache_fresh,
     load_multi_exchange_universe,
@@ -60,13 +64,19 @@ from quant_project.model_selection import (
     split_prices,
 )
 from quant_project.performance import (
+    EULER_MASCHERONI,
     alpha_beta,
     annualized_return,
     annualized_volatility,
     build_performance_report,
     cumulative_returns,
+    deflated_sharpe_ratio,
     drawdown_series,
+    effective_number_of_trials,
+    expected_maximum_sharpe,
     max_drawdown,
+    probabilistic_sharpe_ratio,
+    sharpe_confidence_interval,
     sharpe_ratio,
 )
 from quant_project.signals.indicators import (
@@ -80,6 +90,7 @@ from quant_project.signals.momentum import (
     channel_breakout_momentum,
     ema_crossover_momentum,
     flow_window_momentum,
+    informed_momentum,
     seasonality_momentum,
     theme_momentum,
     time_horizon_momentum,
@@ -261,6 +272,35 @@ def test_fetch_ohlcv_from_exchange_empty_result_has_expected_columns():
     assert result.empty
 
 
+def test_drop_incomplete_bars_keeps_only_bars_whose_period_has_closed():
+    df = pd.DataFrame({"close": [1.0, 2.0, 3.0]}, index=_idx(3))  # 01-01, 01-02, 01-03
+
+    # Midday on 01-03: the 01-03 daily bar is still forming (closes 01-04 00:00).
+    midday = drop_incomplete_bars(df, "1d", now=pd.Timestamp("2024-01-03 12:00"))
+    assert list(midday.index) == list(_idx(2))
+
+    # Exactly at 01-03 00:00 the 01-02 bar has just closed, so it's kept.
+    boundary = drop_incomplete_bars(df, "1d", now=pd.Timestamp("2024-01-03 00:00"))
+    assert list(boundary.index) == list(_idx(2))
+
+
+def test_fetch_ohlcv_from_exchange_drops_bar_still_forming():
+    day_ms = 86_400_000
+    page = [[0, 1, 1, 1, 1, 1], [day_ms, 1, 1, 1, 1, 1], [2 * day_ms, 1, 1, 1, 1, 1]]
+    exchange = _FakeExchange([page])
+
+    result = fetch_ohlcv_from_exchange(
+        exchange,
+        "BTC/USDT",
+        "1d",
+        start=pd.Timestamp(0, unit="ms"),
+        end=pd.Timestamp(2 * day_ms, unit="ms"),
+        now=pd.Timestamp(2 * day_ms + 3_600_000, unit="ms"),  # 1h into the third bar
+    )
+
+    assert list(result.index) == [pd.Timestamp(0, unit="ms"), pd.Timestamp(day_ms, unit="ms")]
+
+
 # ---------------------------------------------------------------------------
 # 1.3 / 1.4 / 7.3 Parquet cache
 # ---------------------------------------------------------------------------
@@ -393,6 +433,36 @@ def test_load_symbol_ohlcv_force_refresh_bypasses_cache(tmp_path):
     assert exchange.calls == 2
 
 
+def test_load_symbol_ohlcv_refetched_bar_replaces_stale_cached_copy(tmp_path):
+    cache_dir = tmp_path / "cache"
+    # The cache holds 01-01..01-02, with a provisional close of 1.0 for 01-02.
+    stale = pd.DataFrame(
+        {"open": 1.0, "high": 1.0, "low": 1.0, "close": [1.0, 1.0], "volume": 1.0},
+        index=pd.DatetimeIndex(["2024-01-01", "2024-01-02"], name="timestamp"),
+    )
+    path = cache_path("binance", "BTC/USDT", "1d", cache_dir=cache_dir)
+    write_cache(stale, path)
+
+    # Asking for 01-03 too isn't covered by the cache -> refetch, which
+    # returns the final 01-02 close (2.0) alongside the new 01-03 bar.
+    day_ms = 86_400_000
+    jan1_ms = int(pd.Timestamp("2024-01-01").timestamp() * 1000)
+    page = [
+        [jan1_ms + day_ms, 1, 1, 1, 2.0, 1],
+        [jan1_ms + 2 * day_ms, 1, 1, 1, 3.0, 1],
+    ]
+    request = DataRequest("binance", ["BTC/USDT"], "1d", "2024-01-01", "2024-01-03")
+    exchange = _FakeExchange([page])
+
+    df, report = load_symbol_ohlcv(
+        request, "BTC/USDT", cache_dir=cache_dir, exchange=exchange, audit_log_path=None
+    )
+
+    assert list(df["close"]) == [1.0, 2.0, 3.0]  # fresh 01-02 close wins over the cached one
+    assert report.duplicates_removed == 0
+    assert not read_cache(path).index.duplicated().any()  # no duplicates written back
+
+
 def test_load_universe_ohlcv_loads_every_symbol(tmp_path):
     cache_dir = tmp_path / "cache"
     request = DataRequest(
@@ -512,6 +582,34 @@ def test_build_close_price_panel_rejects_all_insufficient():
         build_close_price_panel(universe)
 
 
+def test_build_field_panel_selects_the_requested_column():
+    def entry(close: list[float], volume: list[float]) -> tuple:
+        df = pd.DataFrame({"close": close, "volume": volume}, index=_idx(len(close)))
+        report = ValidationReport(
+            cleaned=df,
+            duplicates_removed=0,
+            gap_timestamps=pd.DatetimeIndex([]),
+            has_sufficient_history=True,
+        )
+        return df, report
+
+    universe = {
+        "BTC/USDT": entry([100.0, 101.0], [5.0, 6.0]),
+        "ETH/USDT": entry([10.0, 10.5], [50.0, 70.0]),
+    }
+
+    panel = build_field_panel(universe, "volume")
+
+    expected = pd.DataFrame({"BTC/USDT": [5.0, 6.0], "ETH/USDT": [50.0, 70.0]}, index=_idx(2))
+    pd.testing.assert_frame_equal(panel.sort_index(axis=1), expected)
+
+
+def test_build_field_panel_rejects_unknown_field():
+    universe = {"BTC/USDT": _universe_entry([100.0, 101.0])}
+    with pytest.raises(ValueError, match="Unknown OHLCV field"):
+        build_field_panel(universe, "vwap")
+
+
 # =============================================================================
 # signals/momentum.py (Feature 2)
 # =============================================================================
@@ -559,6 +657,38 @@ def test_activity_weighted_momentum_scales_by_relative_activity():
             "B": [np.nan, -0.10 * 1.0, -0.10 * 1.0, 0.10 * (20 / 15)],
         },
         index=_idx(4),
+    )
+    pd.testing.assert_frame_equal(result, expected, check_exact=False, atol=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# informed_momentum (high-volume mirror of reversal.uninformed_reversal)
+# ---------------------------------------------------------------------------
+def test_informed_momentum_masks_out_low_activity_assets():
+    prices = pd.DataFrame(
+        {"A": [100.0, 110.0, 121.0], "B": [100.0, 90.0, 81.0], "C": [100.0, 105.0, 110.25]},
+        index=_idx(3),
+    )
+    activity = pd.DataFrame(
+        {"A": [10.0, 10.0, 30.0], "B": [10.0, 10.0, 10.0], "C": [10.0, 10.0, 20.0]},
+        index=_idx(3),
+    )
+
+    result = informed_momentum(
+        prices, activity, lookback=1, activity_lookback=2, high_activity_quantile=0.5
+    )
+
+    # base momentum (=pct_change): A=[nan,.10,.10] B=[nan,-.10,-.10] C=[nan,.05,.05]
+    # relative_activity = activity / rolling(2).mean():
+    #   t1: A=B=C=1.0 -> median=1.0 -> all >=1.0 -> all kept
+    #   t2: A=30/20=1.5  B=10/10=1.0  C=20/15=1.333 -> median=1.333 -> only A,C >=1.333 -> B masked
+    expected = pd.DataFrame(
+        {
+            "A": [np.nan, 0.10, 0.10],
+            "B": [np.nan, -0.10, np.nan],
+            "C": [np.nan, 0.05, 0.05],
+        },
+        index=_idx(3),
     )
     pd.testing.assert_frame_equal(result, expected, check_exact=False, atol=1e-9)
 
@@ -947,6 +1077,24 @@ def test_net_of_costs_subtracts_cost_from_gross_returns():
 
     # market cost = 20bps * turnover: [0.001, 0.002]
     pd.testing.assert_series_equal(net, pd.Series([0.009, 0.018]), check_exact=False, atol=1e-9)
+
+
+def test_breakeven_cost_bps_is_mean_gross_over_mean_turnover():
+    gross_returns = pd.Series([0.002, 0.000, 0.001])  # mean 0.001
+    turnover = pd.Series([1.0, 0.5, 0.5])  # mean 2/3
+
+    breakeven = breakeven_cost_bps(gross_returns, turnover)
+
+    # 0.001 / (2/3) = 0.0015 = 15 bps; charging exactly that leaves a zero mean net return.
+    assert breakeven == pytest.approx(15.0)
+    assert (gross_returns - turnover * breakeven / 10_000).mean() == pytest.approx(0.0)
+
+
+def test_breakeven_cost_bps_negative_when_losing_before_costs_and_nan_without_trading():
+    assert breakeven_cost_bps(pd.Series([-0.001, -0.001]), pd.Series([1.0, 1.0])) == pytest.approx(
+        -10.0
+    )
+    assert np.isnan(breakeven_cost_bps(pd.Series([0.01, 0.02]), pd.Series([0.0, 0.0])))
 
 
 # =============================================================================
@@ -1594,6 +1742,91 @@ def test_build_performance_report_without_benchmark_leaves_alpha_beta_none():
     assert report.beta is None
     assert report.alpha_t_stat is None
     assert report.correlation is None
+
+
+# ---------------------------------------------------------------------------
+# Sharpe uncertainty: bootstrap interval, PSR, DSR, effective trials
+# ---------------------------------------------------------------------------
+def _normal_returns(n: int, mean: float, std: float, seed: int) -> pd.Series:
+    return pd.Series(np.random.default_rng(seed).normal(mean, std, n), index=_idx(n))
+
+
+def test_sharpe_confidence_interval_is_reproducible_and_brackets_the_estimate():
+    returns = _normal_returns(1000, 0.001, 0.02, seed=1)
+
+    first = sharpe_confidence_interval(returns, seed=7)
+    second = sharpe_confidence_interval(returns, seed=7)
+
+    assert first == second
+    assert first[0] < sharpe_ratio(returns) < first[1]
+
+
+def test_sharpe_confidence_interval_width_matches_theory_for_normal_returns():
+    # For i.i.d. normal returns the annualized Sharpe has standard error
+    # ~sqrt(365 / T): T=1825 -> sqrt(0.2) = 0.447, so a 95% interval is
+    # about 2 * 1.96 * 0.447 = 1.75 wide.
+    returns = _normal_returns(1825, 0.0, 0.02, seed=3)
+
+    low, high = sharpe_confidence_interval(returns, block_length=1)
+
+    assert high - low == pytest.approx(1.75, rel=0.1)
+
+
+def test_sharpe_confidence_interval_rejects_too_short_series():
+    with pytest.raises(ValueError, match="block bootstrap"):
+        sharpe_confidence_interval(_normal_returns(15, 0.0, 0.01, seed=0), block_length=10)
+
+
+def test_probabilistic_sharpe_ratio_is_one_half_at_the_observed_sharpe():
+    returns = _normal_returns(500, 0.001, 0.02, seed=4)
+
+    # Benchmark equal to the observed (annualized) Sharpe -> z = 0 -> 0.5.
+    assert probabilistic_sharpe_ratio(returns, sharpe_ratio(returns)) == pytest.approx(0.5)
+    assert probabilistic_sharpe_ratio(returns, 0.0) > 0.5  # positive mean return
+
+
+def test_probabilistic_sharpe_ratio_matches_hand_computation():
+    returns = pd.Series([0.02, -0.01, 0.03, 0.0, -0.02, 0.04, 0.01, -0.005])
+
+    sr = returns.mean() / returns.std()
+    skew, kurtosis = returns.skew(), returns.kurt() + 3.0
+    z = sr * np.sqrt(len(returns) - 1) / np.sqrt(1 - skew * sr + (kurtosis - 1) / 4 * sr**2)
+
+    assert probabilistic_sharpe_ratio(returns, 0.0) == pytest.approx(NormalDist().cdf(z))
+
+
+def test_expected_maximum_sharpe_follows_false_strategy_theorem():
+    # N=10, T=101 -> per-period sd of a no-edge Sharpe estimate = 1/sqrt(100) = 0.1.
+    normal = NormalDist()
+    expected_max_z = (1 - EULER_MASCHERONI) * normal.inv_cdf(
+        1 - 1 / 10
+    ) + EULER_MASCHERONI * normal.inv_cdf(1 - 1 / (10 * np.e))
+
+    result = expected_maximum_sharpe(10, 101, periods_per_year=1)
+
+    assert result == pytest.approx(0.1 * expected_max_z)
+    assert expected_maximum_sharpe(1, 101) == 0.0  # one trial: nothing to deflate
+
+
+def test_deflated_sharpe_ratio_equals_psr_for_one_trial_and_falls_with_more():
+    returns = _normal_returns(1000, 0.001, 0.02, seed=5)
+
+    assert deflated_sharpe_ratio(returns, 1) == pytest.approx(probabilistic_sharpe_ratio(returns))
+    assert deflated_sharpe_ratio(returns, 50) < deflated_sharpe_ratio(returns, 5)
+
+
+def test_effective_number_of_trials_counts_independent_bets():
+    rng = np.random.default_rng(6)
+    a, b, c = (pd.Series(rng.normal(size=5000)) for _ in range(3))
+
+    # Three unrelated series -> ~3 independent trials.
+    assert effective_number_of_trials(pd.DataFrame({"a": a, "b": b, "c": c})) == pytest.approx(
+        3.0, rel=0.01
+    )
+    # A strategy, an exact copy and its exact opposite are one bet.
+    assert effective_number_of_trials(pd.DataFrame({"a": a, "copy": a, "opposite": -a})) == (
+        pytest.approx(1.0)
+    )
 
 
 # =============================================================================

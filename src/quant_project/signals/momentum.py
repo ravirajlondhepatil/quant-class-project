@@ -5,10 +5,13 @@ asset likely to keep moving the way it's been moving?" They fall into two
 families:
 
 - **Cross-sectional score** functions (``time_horizon_momentum``,
-  ``activity_weighted_momentum``, ``seasonality_momentum``, ``theme_momentum``,
-  ``flow_window_momentum``) return a continuous DataFrame (time x assets)
-  that is *higher* for assets expected to keep outperforming. These are our
-  own formulations, from specs/feature-list.md 2.1-2.5.
+  ``activity_weighted_momentum``, ``informed_momentum``,
+  ``seasonality_momentum``, ``theme_momentum``, ``flow_window_momentum``)
+  return a continuous DataFrame (time x assets) that is *higher* for assets
+  expected to keep outperforming. These are our own formulations, from
+  specs/feature-list.md 2.1-2.5 (``informed_momentum`` is the high-volume
+  mirror of ``reversal.uninformed_reversal``, added for the mentor review's
+  volume follow-up).
 
 - **Discrete position** functions (``channel_breakout_momentum``,
   ``ema_crossover_momentum``) return -1/0/+1 per asset per bar, matching two
@@ -61,6 +64,33 @@ def activity_weighted_momentum(
     avg_activity = activity.rolling(activity_lookback).mean()
     relative_activity = activity / avg_activity
     return raw_momentum * relative_activity
+
+
+def informed_momentum(
+    prices: pd.DataFrame,
+    activity: pd.DataFrame,
+    lookback: int,
+    activity_lookback: int,
+    high_activity_quantile: float = 0.7,
+) -> pd.DataFrame:
+    """Momentum isolated to periods of unusually high trading activity.
+
+    Hypothesis: a price move made on heavy volume is more likely to carry
+    information, so it should continue rather than reverse (the
+    "speculative trading" case in Llorente, Michaely, Saar & Wang, 2002).
+    The mirror image of ``reversal.uninformed_reversal``: same relative
+    activity measure (activity over its own trailing ``activity_lookback``
+    mean), but the momentum signal is kept only where relative activity is
+    at or *above* the ``high_activity_quantile`` cross-sectional cutoff for
+    that bar, and is NaN (no position) everywhere else.
+    """
+    momentum = time_horizon_momentum(prices, lookback)
+    avg_activity = activity.rolling(activity_lookback).mean()
+    relative_activity = activity / avg_activity
+
+    cutoff = relative_activity.quantile(high_activity_quantile, axis=1)
+    is_high_activity = relative_activity.ge(cutoff, axis=0)
+    return momentum.where(is_high_activity)
 
 
 # ---------------------------------------------------------------------------
