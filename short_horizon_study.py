@@ -296,7 +296,7 @@ def best_days(data: StudyData) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # Experiment 3: volume
 # ---------------------------------------------------------------------------
-def _volume_signals(data: StudyData) -> dict[str, pd.DataFrame]:
+def volume_signals(data: StudyData) -> dict[str, pd.DataFrame]:
     prices, volume = data.prices, data.volume
     return {
         "momentum_1d, all coins": time_horizon_momentum(prices, lookback=1),
@@ -319,7 +319,7 @@ def volume_experiment(data: StudyData) -> pd.DataFrame:
     light volume is more likely noise or liquidity-driven and should
     reverse. Each conditioned strategy is compared with its unconditioned
     version on the same days."""
-    results = run_multi_strategy_backtest(_volume_signals(data), data.returns)
+    results = run_multi_strategy_backtest(volume_signals(data), data.returns)
     return stats_table(results, data)
 
 
@@ -328,7 +328,7 @@ def volume_spread_test(data: StudyData) -> pd.DataFrame:
     1-day momentum among high-volume coins minus 1-day momentum among
     low-volume coins. If heavy-volume moves continue and light-volume moves
     reverse, this spread is positive."""
-    signals = _volume_signals(data)
+    signals = volume_signals(data)
     results = run_multi_strategy_backtest(
         {
             "high": signals["momentum_1d, high-volume coins"],

@@ -17,11 +17,20 @@ standard closed-form OLS intercept standard-error formula).
 strategies trade crypto (24/7, no market closures) rather than a
 5-day-a-week equity calendar; pass a different value for a coarser
 (e.g. hourly) timeframe.
+
+The last section asks how much of a Sharpe ratio could be luck: a
+bootstrap confidence interval for one strategy, and the probabilistic and
+deflated Sharpe ratios (Bailey & López de Prado) for the best of many
+strategies tried. The normal distribution comes from the standard
+library's ``statistics.NormalDist``, for the same reason there's no
+``scipy`` above.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from statistics import NormalDist
 
 import numpy as np
 import pandas as pd
@@ -29,6 +38,8 @@ import pandas as pd
 from quant_project.backtest import BacktestResult
 
 DEFAULT_PERIODS_PER_YEAR = 365
+
+EULER_MASCHERONI = 0.5772156649015329
 
 
 # ---------------------------------------------------------------------------
@@ -259,3 +270,124 @@ def build_performance_report(
         alpha_t_stat=alpha_t_stat,
         correlation=correlation,
     )
+
+
+# ---------------------------------------------------------------------------
+# How much of a Sharpe ratio could be luck?
+# ---------------------------------------------------------------------------
+def sharpe_confidence_interval(
+    returns: pd.Series,
+    level: float = 0.95,
+    block_length: int = 10,
+    n_resamples: int = 5000,
+    seed: int = 0,
+    periods_per_year: int = DEFAULT_PERIODS_PER_YEAR,
+) -> tuple[float, float]:
+    """Moving-block bootstrap confidence interval for the annualized Sharpe ratio.
+
+    Resamples the return series in overlapping blocks of ``block_length``
+    periods (10 days by default, about two weeks), recomputes the Sharpe
+    ratio on each resample, and returns the percentile interval. Blocks
+    keep any short-run autocorrelation; resampling, rather than a formula,
+    keeps the fat tails. That matters here: the usual analytic standard
+    error adjusts for skew in a way that *narrows* the interval when one
+    huge positive day dominates a series, which is backwards for a result
+    that depends on that one day. ``seed`` makes the interval reproducible.
+    """
+    values = returns.dropna().to_numpy()
+    n = len(values)
+    if n < 2 * block_length:
+        raise ValueError(f"need at least {2 * block_length} returns for a block bootstrap")
+
+    rng = np.random.default_rng(seed)
+    n_blocks = math.ceil(n / block_length)
+    starts = rng.integers(0, n - block_length + 1, size=(n_resamples, n_blocks))
+    index = (starts[:, :, None] + np.arange(block_length)).reshape(n_resamples, -1)[:, :n]
+    resampled = values[index]
+    sharpes = resampled.mean(axis=1) / resampled.std(axis=1, ddof=1) * np.sqrt(periods_per_year)
+
+    tail = (1.0 - level) / 2.0 * 100.0
+    low, high = np.nanpercentile(sharpes, [tail, 100.0 - tail])
+    return float(low), float(high)
+
+
+def probabilistic_sharpe_ratio(
+    returns: pd.Series,
+    benchmark_sharpe: float = 0.0,
+    periods_per_year: int = DEFAULT_PERIODS_PER_YEAR,
+) -> float:
+    """Probability that the true Sharpe ratio beats ``benchmark_sharpe``
+    (annualized), given this return series (Bailey & López de Prado, 2012).
+
+    Uses the standard error of a Sharpe estimate allowing for skewness and
+    fat tails: per period, ``sqrt((1 - skew*SR + (kurtosis - 1)/4 * SR^2) / (T - 1))``,
+    with ``kurtosis`` the ordinary (non-excess) kurtosis.
+    """
+    values = returns.dropna()
+    n = len(values)
+    sharpe = values.mean() / values.std()
+    benchmark = benchmark_sharpe / np.sqrt(periods_per_year)
+    skew = values.skew()
+    kurtosis = values.kurt() + 3.0
+    variance_factor = 1.0 - skew * sharpe + (kurtosis - 1.0) / 4.0 * sharpe**2
+    z = (sharpe - benchmark) * np.sqrt(n - 1) / np.sqrt(variance_factor)
+    return NormalDist().cdf(float(z))
+
+
+def expected_maximum_sharpe(
+    n_trials: float,
+    n_observations: int,
+    periods_per_year: int = DEFAULT_PERIODS_PER_YEAR,
+) -> float:
+    """The annualized Sharpe ratio the best of ``n_trials`` independent
+    strategies with *no* edge would show, on average, by luck alone.
+
+    The approximation from Bailey & López de Prado's "False Strategy
+    Theorem": ``sd * ((1 - g) * Z^-1(1 - 1/N) + g * Z^-1(1 - 1/(N e)))``,
+    with ``g`` the Euler-Mascheroni constant. For ``sd`` (the spread of
+    Sharpe estimates across trials) this uses what the no-edge hypothesis
+    itself implies, ``1 / sqrt(T - 1)`` per period, rather than the spread
+    of the trials actually run. The trials' own spread mixes luck with real
+    differences (a strategy that pays heavy costs really is worse), and
+    would set the bar for luck too high. One trial needs no deflating, so
+    it returns 0.
+    """
+    if n_trials <= 1:
+        return 0.0
+    normal = NormalDist()
+    expected_max_z = (1.0 - EULER_MASCHERONI) * normal.inv_cdf(
+        1.0 - 1.0 / n_trials
+    ) + EULER_MASCHERONI * normal.inv_cdf(1.0 - 1.0 / (n_trials * math.e))
+    per_period_sd = 1.0 / np.sqrt(n_observations - 1)
+    return float(per_period_sd * expected_max_z * np.sqrt(periods_per_year))
+
+
+def deflated_sharpe_ratio(
+    returns: pd.Series,
+    n_trials: float,
+    periods_per_year: int = DEFAULT_PERIODS_PER_YEAR,
+) -> float:
+    """Probability that a strategy's true Sharpe ratio beats what the best of
+    ``n_trials`` no-edge strategies would show by luck (Bailey & López de
+    Prado, 2014): the probabilistic Sharpe ratio against
+    ``expected_maximum_sharpe`` instead of against zero. Use it on the
+    *best* of several strategies tried; 0.95 is the usual bar.
+    """
+    n_observations = len(returns.dropna())
+    hurdle = expected_maximum_sharpe(n_trials, n_observations, periods_per_year)
+    return probabilistic_sharpe_ratio(returns, hurdle, periods_per_year)
+
+
+def effective_number_of_trials(trial_returns: pd.DataFrame) -> float:
+    """How many *independent* strategies a set of correlated ones amounts to.
+
+    ``N^2 / sum of squared pairwise correlations`` (the participation ratio
+    of the correlation matrix's eigenvalues): N for uncorrelated trials, 1
+    when every trial is the same bet. Squaring means a strategy and its
+    exact opposite (momentum and reversal over the same lookback) count as
+    one bet, which is right: trying both directions is one idea. It's a
+    rough estimate; López de Prado's later work clusters the trials instead.
+    """
+    correlations = trial_returns.corr().to_numpy()
+    n = correlations.shape[0]
+    return float(n**2 / np.nansum(correlations**2))

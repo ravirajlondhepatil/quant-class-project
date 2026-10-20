@@ -11,6 +11,7 @@ numbers, not just confirm it runs.
 from __future__ import annotations
 
 from pathlib import Path
+from statistics import NormalDist
 
 import numpy as np
 import pandas as pd
@@ -63,13 +64,19 @@ from quant_project.model_selection import (
     split_prices,
 )
 from quant_project.performance import (
+    EULER_MASCHERONI,
     alpha_beta,
     annualized_return,
     annualized_volatility,
     build_performance_report,
     cumulative_returns,
+    deflated_sharpe_ratio,
     drawdown_series,
+    effective_number_of_trials,
+    expected_maximum_sharpe,
     max_drawdown,
+    probabilistic_sharpe_ratio,
+    sharpe_confidence_interval,
     sharpe_ratio,
 )
 from quant_project.signals.indicators import (
@@ -1735,6 +1742,91 @@ def test_build_performance_report_without_benchmark_leaves_alpha_beta_none():
     assert report.beta is None
     assert report.alpha_t_stat is None
     assert report.correlation is None
+
+
+# ---------------------------------------------------------------------------
+# Sharpe uncertainty: bootstrap interval, PSR, DSR, effective trials
+# ---------------------------------------------------------------------------
+def _normal_returns(n: int, mean: float, std: float, seed: int) -> pd.Series:
+    return pd.Series(np.random.default_rng(seed).normal(mean, std, n), index=_idx(n))
+
+
+def test_sharpe_confidence_interval_is_reproducible_and_brackets_the_estimate():
+    returns = _normal_returns(1000, 0.001, 0.02, seed=1)
+
+    first = sharpe_confidence_interval(returns, seed=7)
+    second = sharpe_confidence_interval(returns, seed=7)
+
+    assert first == second
+    assert first[0] < sharpe_ratio(returns) < first[1]
+
+
+def test_sharpe_confidence_interval_width_matches_theory_for_normal_returns():
+    # For i.i.d. normal returns the annualized Sharpe has standard error
+    # ~sqrt(365 / T): T=1825 -> sqrt(0.2) = 0.447, so a 95% interval is
+    # about 2 * 1.96 * 0.447 = 1.75 wide.
+    returns = _normal_returns(1825, 0.0, 0.02, seed=3)
+
+    low, high = sharpe_confidence_interval(returns, block_length=1)
+
+    assert high - low == pytest.approx(1.75, rel=0.1)
+
+
+def test_sharpe_confidence_interval_rejects_too_short_series():
+    with pytest.raises(ValueError, match="block bootstrap"):
+        sharpe_confidence_interval(_normal_returns(15, 0.0, 0.01, seed=0), block_length=10)
+
+
+def test_probabilistic_sharpe_ratio_is_one_half_at_the_observed_sharpe():
+    returns = _normal_returns(500, 0.001, 0.02, seed=4)
+
+    # Benchmark equal to the observed (annualized) Sharpe -> z = 0 -> 0.5.
+    assert probabilistic_sharpe_ratio(returns, sharpe_ratio(returns)) == pytest.approx(0.5)
+    assert probabilistic_sharpe_ratio(returns, 0.0) > 0.5  # positive mean return
+
+
+def test_probabilistic_sharpe_ratio_matches_hand_computation():
+    returns = pd.Series([0.02, -0.01, 0.03, 0.0, -0.02, 0.04, 0.01, -0.005])
+
+    sr = returns.mean() / returns.std()
+    skew, kurtosis = returns.skew(), returns.kurt() + 3.0
+    z = sr * np.sqrt(len(returns) - 1) / np.sqrt(1 - skew * sr + (kurtosis - 1) / 4 * sr**2)
+
+    assert probabilistic_sharpe_ratio(returns, 0.0) == pytest.approx(NormalDist().cdf(z))
+
+
+def test_expected_maximum_sharpe_follows_false_strategy_theorem():
+    # N=10, T=101 -> per-period sd of a no-edge Sharpe estimate = 1/sqrt(100) = 0.1.
+    normal = NormalDist()
+    expected_max_z = (1 - EULER_MASCHERONI) * normal.inv_cdf(
+        1 - 1 / 10
+    ) + EULER_MASCHERONI * normal.inv_cdf(1 - 1 / (10 * np.e))
+
+    result = expected_maximum_sharpe(10, 101, periods_per_year=1)
+
+    assert result == pytest.approx(0.1 * expected_max_z)
+    assert expected_maximum_sharpe(1, 101) == 0.0  # one trial: nothing to deflate
+
+
+def test_deflated_sharpe_ratio_equals_psr_for_one_trial_and_falls_with_more():
+    returns = _normal_returns(1000, 0.001, 0.02, seed=5)
+
+    assert deflated_sharpe_ratio(returns, 1) == pytest.approx(probabilistic_sharpe_ratio(returns))
+    assert deflated_sharpe_ratio(returns, 50) < deflated_sharpe_ratio(returns, 5)
+
+
+def test_effective_number_of_trials_counts_independent_bets():
+    rng = np.random.default_rng(6)
+    a, b, c = (pd.Series(rng.normal(size=5000)) for _ in range(3))
+
+    # Three unrelated series -> ~3 independent trials.
+    assert effective_number_of_trials(pd.DataFrame({"a": a, "b": b, "c": c})) == pytest.approx(
+        3.0, rel=0.01
+    )
+    # A strategy, an exact copy and its exact opposite are one bet.
+    assert effective_number_of_trials(pd.DataFrame({"a": a, "copy": a, "opposite": -a})) == (
+        pytest.approx(1.0)
+    )
 
 
 # =============================================================================

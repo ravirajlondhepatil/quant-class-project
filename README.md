@@ -20,7 +20,7 @@ The more useful finding is why. Before costs, all four main strategies are flat 
 | 1-day momentum (reversal flipped) | −0.04 / +1.26 | −4.09 / −1.38 | 0 / 10 | 1.40 / 1.42 |
 | Combined (inverse-vol weights) | +0.59 / −0.87 | −1.55 / −3.24 | 6 / −7 | 0.65 / 0.74 |
 
-Each cell is training / test. Breakeven cost is the cost per unit traded at which a strategy would exactly break even, so a strategy with a breakeven below 20 bps loses money on market orders, and one below 7 bps loses even on limit orders. Turnover is the fraction of the book traded each day.
+Each cell is training / test. Breakeven cost is the cost per unit traded at which a strategy would exactly break even, so a strategy with a breakeven below 20 bps loses money on market orders, and one below 7 bps loses even on limit orders. Turnover is the fraction of the book traded each day. Every Sharpe here has a 95% confidence interval of roughly ±1.1 in training and ±1.8 in test (the notebook prints each one), and before costs every interval includes zero.
 
 ![Cumulative returns before and after costs for the four main strategies](docs/gross_vs_net.png)
 
@@ -29,6 +29,14 @@ Each cell is training / test. Breakeven cost is the cost per unit traded at whic
 The first 70% of the sample (up to 29 August 2025) is the training period and the last 30% is the test period. The momentum lookback, the EMA pair and the way the signals are combined were all chosen on training data, and the test period was only used to judge those choices. Portfolios are dollar-neutral long-short. Positions are set at each daily close from data up to that close and held to the next one. Costs follow the course brief: 7 bps commission plus 13 bps slippage on market orders, 7 bps on limit orders.
 
 A 5-fold walk-forward search (`optimize.py`) re-picks the parameters fold by fold. Its best out-of-sample result, EMA crossover at a net Sharpe of +0.20 (alpha t-stat 0.27), can't be told apart from zero.
+
+## How much of this could be luck?
+
+Quite a lot, and I've tried to measure it.
+
+**Error bars.** Each Sharpe ratio gets a 95% interval from a block bootstrap (daily returns resampled in ten-day blocks, 5,000 times). With under three years of training data the intervals are wide: 21-day momentum's +0.78 before costs could be anything from −0.35 to +1.89. Every interval before costs includes zero. The only statistically clear results are losses, from the fast strategies after costs.
+
+**The search.** Counting every configuration the project's scripts have backtested gives 34 trials. They overlap heavily, since most are one trend bet at different speeds, and their correlations put them at about four independent ideas. The best net result anywhere is EMA crossover 32/96, at +0.61 over the full sample, so I ran it through a deflated Sharpe ratio test (Bailey and López de Prado, 2014), which asks whether it beats what the best of N no-edge strategies would show by luck. Its chance of being real comes out between 17% (N = 34) and 55% (N = 4). The usual bar is 95%.
 
 ## The 1-day result, checked before believing it
 
@@ -47,14 +55,13 @@ The walk-forward optimiser points the same way from the other side. It almost al
 - **The evidence is thin.** None of the positive results before costs has a t-stat of 2 or more. At a Sharpe of 0.78 you'd need about 6½ years of data to get there, and this sample is under 4.
 - **The test period isn't fresh any more.** It has informed several decisions now, so the next test has to be judged on data the project hasn't seen.
 - **Costs are flat.** BTC and FIL pay the same 20 bps, which flatters small coins and penalises big ones. Limit orders are an optimistic way out for momentum, too, because a resting order mostly fills when the price comes back against you.
+- **Shorting is free in the backtest.** In practice the short side would go through perpetual futures, which pay or charge funding, and that isn't modelled.
 - One exchange, daily bars only.
 
 ## Next steps
 
 1. Rebuild the universe point-in-time: each month, the top 50 or so USDT pairs by trailing 30-day dollar volume, including coins that were later delisted. Binance's public archive at data.binance.vision still has their price history.
 2. Test one cost-aware version of 21-day momentum, written down before it's run. It would move only part of the way towards its target weights each day (Gârleanu and Pedersen, 2013), with positions scaled by rank and volatility. With breakeven at 16 to 17 bps against 20 bps of cost, trading less is the one economically sensible route to a positive result. It gets judged once, on coins and dates the project hasn't touched.
-
-The results also need confidence intervals on every Sharpe and a deflated Sharpe ratio for the best one, because dozens of variants have been tried across the project.
 
 ## Reproduce
 
@@ -63,10 +70,11 @@ uv sync                                    # Python 3.12+, managed with uv
 uv run python main.py                      # train/test split, parameter selection, report
 uv run python short_horizon_study.py       # the 1-day follow-up experiments
 uv run python optimize.py                  # 5-fold walk-forward search
+uv run python overfitting_check.py         # error bars, trial count, deflated Sharpe ratio
 uv run --group notebooks jupyter nbconvert --to notebook --execute --inplace notebooks/performance_summary.ipynb
 uv run pytest
 ```
 
 The first run downloads daily data from Binance (no API key needed) and caches it in `data/raw/`. The sample end is pinned in `main.py`, so every run sees the same data, and re-running the notebook also redraws the chart above.
 
-Under the hood: a ccxt data pipeline with validation and a parquet cache, a backtester that lags positions and charges costs on turnover, three ways to combine signals, performance and alpha statistics, and an audit log of every run, all in `src/quant_project/` with 127 tests at 99% coverage.
+Under the hood: a ccxt data pipeline with validation and a parquet cache, a backtester that lags positions and charges costs on turnover, three ways to combine signals, performance and alpha statistics, and an audit log of every run, all in `src/quant_project/` with 135 tests at 99% coverage.
